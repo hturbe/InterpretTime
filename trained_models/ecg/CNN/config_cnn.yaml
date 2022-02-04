@@ -1,0 +1,32 @@
+CONFIGURATION:
+  data_path:  ../../datasets/ecg/CPSC/data_parquet
+  data_type: petastorm
+  epochs: 200
+  feature: signal
+  loss: categorical_crossentropy
+  selected_classes:
+  - 59118001
+  target: diagnostics
+MANIPULATION:
+  channel_first: 'true'
+  feature_scaling: standard
+  resizing_len:
+  - quantile
+  - 0.95
+  resizing_method: end
+  target_encoding: one_hot_encoder
+MODEL:
+  act_fn_name: relu
+  batch_size: 256
+  cell_array:
+  - 128
+  - 256
+  - 32
+  cell_nb1: 128
+  cell_nb2: 256
+  cell_nb3: 32
+  cell_nb4: 0
+  dropout: 0.3069109502496009
+  kernel_size: 11
+  lr: 0.0005846245448374222
+  model_type: cnn

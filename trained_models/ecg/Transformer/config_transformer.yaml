@@ -1,0 +1,28 @@
+CONFIGURATION:
+  data_path: ../../datasets/ecg/CPSC/data_parquet
+  data_type: petastorm
+  epochs: 200
+  feature: signal
+  loss: categorical_crossentropy
+  selected_classes:
+  - 59118001
+  target: diagnostics
+MANIPULATION:
+  channel_first: 'false'
+  feature_scaling: standard
+  resizing_len:
+  - quantile
+  - 0.95
+  resizing_method: end
+  target_encoding: one_hot_encoder
+MODEL:
+  act_fn_name: relu
+  batch_size: 256
+  dropout: 0.2650178500474947
+  input_dropout: 0.3247167445023356
+  lr: 1.8160690389535656e-05
+  mlp_dim: 128
+  model_dim: 512
+  model_type: transformer
+  num_heads: 8
+  num_layers: 3
