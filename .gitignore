@@ -130,19 +130,6 @@ dmypy.json
 
 .vscode/
 
-figures/
-saved_model/
-operations/results_local/*
-!operations/results_local/.gitkeep 
-logs/
 
-!operations/config/
-/operations/config/*
-!/operations/config/examples/
-data/
-results/
 datasets/
-ray_results/
-mlruns/
-operations/mlruns
 **/interpretability_results/*
