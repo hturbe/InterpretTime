@@ -1,5 +1,19 @@
 # InterpretTime: a new approach for the systematic evaluation of neural-network interpretability in time series classification
 
+This repository is the implementation code for :
+[InterpretTime: a new approach for the systematic evaluation of neural-network interpretability in time series classification](http://arxiv.org/abs/2202.05656).
+
+If you find this code or idea useful, please consider citing our work:
+
+```
+@misc{turbé2022interprettime,
+      title={InterpretTime: a new approach for the systematic evaluation of neural-network interpretability in time series classification}, 
+      author={Hugues Turbé and Mina Bjelogrlic and Christian Lovis and Gianmarco Mengaldo},
+      year={2022},
+      eprint={2202.05656},
+}
+```
+
 #### Table of Contents
 * [Overview](#overview)
   + [Family of synthetic datasets](#family-of-synthetic-datasets)
