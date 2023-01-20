@@ -1,0 +1,19 @@
+save_name: "dataset_synthetic_new"
+operations:
+    - parquet
+    - create_split
+dataset_split : [0.7,0.15,0.15]
+properties:
+  nb_simulation: 15000 # number of samples created
+  n_points: 500 # number of time steps in the time series
+  n_support: 100 # length of the support for the feature used to classify the sample
+  n_feature: 6 # number of features
+  f_base: # range of frequency used for the base sine wave
+    - 2
+    - 5
+  f_sin: # range of frequency used for the support sine wave
+    - 10
+    - 50
+  quantile_class: # quantile used to define the class of the sample. They can be more than 2 classes
+    - 0.5
+    - 1

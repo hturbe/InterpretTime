@@ -10,120 +10,33 @@ import glob
 import os
 import re
 import sys
-from functools import reduce
 from os.path import join as pj
-from typing import Union
+from typing import  List, Union
 import warnings
-import matplotlib as mpl
-import matplotlib.dates as mdates
-import matplotlib.pyplot as plt
-import matplotlib.style
-import matplotlib.ticker as ticker
+import more_itertools as mit
 import numpy as np
 import pandas as pd
 import scipy.integrate as integrate
 import torch
-from torch.utils.data import DataLoader, TensorDataset
-from captum.attr import (
-    LRP,
-    DeepLift,
-    DeepLiftShap,
-    GradientShap,
-    IntegratedGradients,
-    KernelShap,
-    Lime,
-    NoiseTunnel,
-    Saliency,
-    ShapleyValueSampling,
-)
-
-from matplotlib.gridspec import GridSpec
-from pandas.plotting import register_matplotlib_converters
-from sklearn import preprocessing
+from torch import nn
 from tqdm import tqdm
 
 # custom packages
 FILEPATH = os.path.dirname(os.path.realpath(__file__))
-sys.path.append(pj(FILEPATH, "../utils"))
-sys.path.append(pj(FILEPATH, "../data_handling"))
 sys.path.append(pj(FILEPATH, ".."))
-
-import utils_data as utils_data
+import shared_utils.utils_data as utils_data
+from learning_pytorch.data_module import PetastormDataModule as DataModule
 from learning_pytorch.Trainable import Trainable
-from ML_Dataset import ML_Dataset
+from learning_pytorch.transform.transform_signal import random_block_enforce_proba
+from shared_utils.utils_path import data_path, results_interp_path
+from shared_utils.utils_visualization import plot_corrupted_signal
+from .method_arguments import dict_method_arguments
 
-# Dictionaries for methods which require a baseline to compute the relevance
-methods_require_baseline = {
-    "integrated_gradients": [IntegratedGradients, "mean"],
-    "deeplift": [DeepLift, "mean"],
-    "deepliftshap": [DeepLiftShap, "sample"],
-    "gradshap": [GradientShap, "sample"],
-    "shapleyvalue": [ShapleyValueSampling, "mean"],
-    "kernelshap": [KernelShap, "mean"],
-    "lime": [Lime, "mean"],
-}
-# Dictionaries for methods which do not require a baseline to compute the relevance
-method_wo_baseline = {"saliency": Saliency, "lrp": LRP}
-
+global device
 device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
-# device = torch.device("cpu")
-# torch.backends.cudnn.enabled=False
+warnings.simplefilter(action="ignore", category=FutureWarning)
 
-# Define plot properties for matplotlib
-SMALL_SIZE = 14
-MEDIUM_SIZE = 16
-BIGGER_SIZE = 18
-mpl.rcParams["lines.linewidth"] = 1.0
-register_matplotlib_converters()
-plt.rc("font", size=MEDIUM_SIZE)  # controls default text sizes
-plt.rc("axes", titlesize=MEDIUM_SIZE)  # fontsize of the axes title
-plt.rc("axes", labelsize=MEDIUM_SIZE)  # fontsize of the x and y labels
-plt.rc("xtick", labelsize=SMALL_SIZE)  # fontsize of the tick labels
-plt.rc("ytick", labelsize=SMALL_SIZE)  # fontsize of the tick labels
-plt.rc("legend", fontsize=SMALL_SIZE)  # legend fontsize
-
-
-def return_baseline(
-    type_baseline: str, signal: Union[np.array, torch.Tensor]
-) -> torch.tensor:
-    """Function to return baseline
-    Parameters
-    ----------
-    type_baseline : str
-        Type of baseline to be used.
-    signal : np.array
-        Signal to be used to compute baseline.
-    Returns
-    -------
-    Baseline: np.array
-    """
-    s = signal.copy()
-    if not isinstance(s, torch.Tensor):
-        s = torch.tensor(s)
-
-    nb_sample = min(signal.shape[0], 250)
-    if type_baseline == "zeros":
-        # return baseline as zeros
-        baseline = torch.zeros(s[:1].shape)
-    elif type_baseline == "random":
-        # return baseline as random values
-        baseline = torch.rand(s[:1].shape)
-    elif type_baseline == "mean":
-        # return baseline as mean of signal
-        baseline = torch.mean(s, dim=0)
-    elif type_baseline == "sample":
-        # return baseline as sample of given size of signal
-        idx_random = np.random.permutation(np.arange(s.shape[0]))
-        idx_random = idx_random[:nb_sample]
-        baseline = s[idx_random]
-
-    baseline = baseline.type(torch.float32)
-    if baseline.ndim == 2:
-        baseline = baseline[None, :, :]
-    return baseline
-
-
-def attribute_series_features(algorithm, net, input, labels_idx, **kwargs):
+def attribute_series_features(algorithm, net, sample, labels_idx, **kwargs):
     """Function to compute the attributions of a given algorithm on a given
     input and labels.
     Parameters
@@ -132,7 +45,7 @@ def attribute_series_features(algorithm, net, input, labels_idx, **kwargs):
         Name of the algorithm to be used.
     net : torch.nn.Module
         Model to be used.
-    input : np.array
+    sample : np.array
         Input to be used.
     labels_idx : np.array
         Labels to be used.
@@ -145,18 +58,99 @@ def attribute_series_features(algorithm, net, input, labels_idx, **kwargs):
     """
 
     net.zero_grad()
-    if isinstance(input, np.ndarray):
-        input = torch.tensor(input.astype(np.float32))
-    input = input.to(device)
+    if isinstance(sample, np.ndarray):
+        sample = torch.tensor(sample.astype(np.float32))
+    sample = sample.to(device_interpretability)
 
-    labels_idx = torch.tensor(labels_idx.astype(np.int64)).to(device)
-    if isinstance(algorithm, ShapleyValueSampling):
-        kwargs["perturbations_per_eval"] = 16
+    labels_idx = torch.tensor(labels_idx.astype(np.int64)).to(device_interpretability)
     # algorithm = NoiseTunnel(algorithm)
-    tensor_attributions = algorithm.attribute(input, target=labels_idx, **kwargs)
+    tensor_attributions = algorithm.attribute(sample, target=labels_idx, **kwargs)
     # draw_baseline_from_distrib = True
 
     return tensor_attributions
+
+
+def spaced_choice(low, high, delta, n_samples):
+    draw = np.random.choice(
+        high - low - (n_samples - 1) * delta, n_samples, replace=False
+    )
+    idx = np.argsort(draw)
+    draw[idx] += np.arange(low, low + delta * n_samples, delta)
+    return draw
+
+
+def resave_score_rel_neg(result_path: str, method_relevance: str):
+    """Function to resave the relevance scores of the methods in the result_path
+     with the score of samples with only rel neg.
+     Parameters
+    ----------
+    result_path : str
+        Path to the result folder.
+    method_relevance : str
+        Name of the method to be used.
+
+    """
+    path_files = os.path.join( result_path, "results_k_feature")
+    path_methods = glob.glob(
+        os.path.join(path_files, f"interpretability_{method_relevance}__*")
+    )
+    path_methods = [x for x in path_methods if "__1.00" not in x]
+    reference_folder = os.path.join(path_files, f"interpretability_{method_relevance}__1.00")
+    if os.path.exists(reference_folder):
+        df_reference_top = pd.read_csv(
+            os.path.join(reference_folder, "results_interp__top.csv"), index_col=0
+        )
+        df_reference_top = df_reference_top.loc[:, "score2"]
+        df_reference_top.name = "score_onlyrel_neg"
+
+        df_reference_bottom = pd.read_csv(
+            os.path.join(reference_folder, "results_interp__bottom.csv"), index_col=0
+        )
+        df_reference_bottom = df_reference_bottom.loc[:, "score2"]
+        df_reference_bottom.name = "score_onlyrel_neg"
+
+        for path in path_methods:
+            df_tmp_top = pd.read_csv(
+                os.path.join(path, "results_interp__top.csv"), index_col=0
+            )
+            if "metric_normalised" in df_tmp_top.columns:
+                continue
+            else:
+                df_tmp_top = df_tmp_top.join(df_reference_top)
+                df_tmp_top.loc[:, "metric_normalised"] = df_tmp_top.loc[
+                    :, "delta_score1"
+                ] / (
+                    df_tmp_top.loc[:, "score1"] - df_tmp_top.loc[:, "score_onlyrel_neg"]
+                )
+                df_tmp_top.loc[:, "metric_normalised"] = np.clip(
+                    df_tmp_top.loc[:, "metric_normalised"], 0, 1
+                )
+                df_tmp_top.to_csv(os.path.join(path, "results_interp__top.csv"))
+
+            df_tmp_bottom = pd.read_csv(
+                os.path.join(path, "results_interp__bottom.csv"), index_col=0
+            )
+            if "metric_normalised" in df_tmp_bottom.columns:
+                continue
+            else:
+
+                df_tmp_bottom = df_tmp_bottom.join(df_reference_bottom)
+                df_tmp_bottom.loc[:, "metric_normalised"] = df_tmp_bottom.loc[
+                    :, "delta_score1"
+                ] / (
+                    df_tmp_bottom.loc[:, "score1"]
+                    - df_tmp_bottom.loc[:, "score_onlyrel_neg"]
+                )
+                df_tmp_bottom.loc[:, "metric_normalised"] = np.clip(
+                    df_tmp_bottom.loc[:, "metric_normalised"], 0, 1
+                )
+                df_tmp_bottom.to_csv(os.path.join(path, "results_interp__bottom.csv"))
+    else:
+        print(
+            f"Score for reference with only negative relevance {method_relevance} not found. Please run for k_feature=1"
+        )
+
+    return True
 
 
 class ScoreComputation:
@@ -165,23 +159,33 @@ class ScoreComputation:
 
     """
 
-    def __init__(self, results_path, names, plot_signal=False):
+    def __init__(
+        self, model_path, names, model_output="probabilities", plot_signal=False
+    ):
         """
         Parameters
         ----------
-        results_path : str
+        model_path : str
             Path to the folder where the results are stored.
         names : list
             List of names of the datasets to be used.
         plot_signal : bool
             Boolean to indicate if the signal should be plotted.
         """
-        self.results_path = results_path
+        self.model_path = model_path
         self.names = names
         self.plot_signal = plot_signal
-        if self.plot_signal == False or self.plot_signal == None:
+        if self.plot_signal is False or self.plot_signal is None:
             self.plot_signal = 0
-        self.save_results = os.path.join(self.results_path, "interpretability_results")
+        self.model_output = model_output
+
+        name_sim = os.path.split(self.model_path)[-1]
+        # self.save_results = os.path.abspath(
+        # os.path.join(FILEPATH, "../../results", name_sim)
+        # )
+        self.save_results = os.path.join(
+            results_interp_path, name_sim, "interpretability_results"
+        )
 
         if not os.path.exists(self.save_results):
             os.makedirs(self.save_results)
@@ -201,41 +205,66 @@ class ScoreComputation:
             Datframe with relevance computed by the method.
         """
 
-        pred = torch.tensor([], device=device, requires_grad=False)
-        batch_size = 4
+        lstm_network_bool = any(
+            [
+                isinstance(module, torch.nn.modules.rnn.LSTM)
+                for module in self.model.modules()
+            ]
+        )
+        global device_interpretability
+        if (lstm_network_bool) & (
+            dict_method_arguments[method_relevance]["noback_cudnn"]
+        ):
+            print(
+                "Attribution for LSTM based network is not supported on GPU. Switching to CPU"
+            )
+            device_interpretability = torch.device("cpu")
+            self.model.to(device_interpretability)
+        else:
+            device_interpretability = (
+                torch.device("cuda:0")
+                if torch.cuda.is_available()
+                else torch.device("cpu")
+            )
+            self.model.to(device_interpretability)
+
+        batch_size = dict_method_arguments[method_relevance].get("batch_size", 16)
+        # Extract target idx of the preds
+        pred_class_idx = np.argmax(self.score_pred, axis=1)
+        print(f"Evaluating relevance using {method_relevance}")
+        torch_rel = torch.tensor(
+            [], device=device_interpretability, requires_grad=False
+        )
+
         batched_sample = np.array_split(
             self.np_signal, np.ceil(self.np_signal.shape[0] / batch_size)
         )
-        for sample in batched_sample:
-            with torch.no_grad():
-                pred = torch.cat(
-                    (
-                        pred,
-                        self.model(
-                            torch.Tensor(sample.astype(np.float32)).squeeze().to(device)
-                        ),
-                    ),
-                    0,
-                )
-
-        # Extract target idx of the labels
-        target_class_idx = np.argmax(pred.detach().cpu().numpy(), axis=1)
-        print(f"Evaluating relevance using {method_relevance}")
-        torch_rel = torch.tensor([], device=device, requires_grad=False)
-
         # We batch samples together to compute the relevance
         batched_idx = np.array_split(
-            target_class_idx, np.ceil(self.np_signal.shape[0] / batch_size)
+            pred_class_idx, np.ceil(self.np_signal.shape[0] / batch_size)
         )
 
         if len(batched_idx) != len(batched_sample):
             raise ValueError("Samples and Target should have the same size")
 
         # Compute relevance for methods with a baseline
-        if method_relevance in methods_require_baseline.keys():
-            rel_method, baseline_type = methods_require_baseline[method_relevance]
-            rel_method = rel_method(self.model)
-            baseline = return_baseline(baseline_type, self.baseline).to(device)
+        if dict_method_arguments[method_relevance]["require_baseline"]:
+            rel_method = dict_method_arguments[method_relevance]["captum_method"]
+            baseline_type = dict_method_arguments[method_relevance]["baseline_type"]
+            kwargs_method = dict_method_arguments[method_relevance].get("kwargs_method")
+
+            rel_method = rel_method(
+                self.model, **(kwargs_method if kwargs_method is not None else {})
+            )
+
+            baseline, expected_value = self._return_baseline(
+                baseline_type, self.baseline
+            )
+            baseline = baseline.to(device_interpretability)
+            self.model.to(device_interpretability)
+            kwargs_attribution = dict_method_arguments[method_relevance].get(
+                "kwargs_attribution"
+            )
             if rel_method.has_convergence_delta():
                 for (sample, target_idx) in tqdm(
                     zip(batched_sample, batched_idx),
@@ -245,16 +274,23 @@ class ScoreComputation:
                     tmp_rel, delta = attribute_series_features(
                         rel_method,
                         self.model,
-                        torch.Tensor(sample.astype(np.float32)).squeeze().to(device),
+                        torch.Tensor(sample.astype(np.float32)).to(
+                            device_interpretability
+                        ),
                         target_idx,
                         baselines=baseline,
                         return_convergence_delta=True,
+                        **(
+                            kwargs_attribution if kwargs_attribution is not None else {}
+                        ),
                     )
-                    torch_rel = torch.cat((torch_rel, tmp_rel), 0)
+                    torch_rel = torch.cat((torch_rel, tmp_rel.detach()), 0)
                     if torch.sum(delta) > 0.1:
                         print(
                             f"Relevance delta for method {method_relevance} is {delta}"
                         )
+
+                    del tmp_rel
             else:
                 for (sample, target_idx) in tqdm(
                     zip(batched_sample, batched_idx),
@@ -264,15 +300,23 @@ class ScoreComputation:
                     tmp_rel = attribute_series_features(
                         rel_method,
                         self.model,
-                        torch.Tensor(sample.astype(np.float32)).squeeze().to(device),
+                        torch.Tensor(sample.astype(np.float32)).to(
+                            device_interpretability
+                        ),
                         target_idx,
                         baselines=baseline,
+                        **(
+                            kwargs_attribution if kwargs_attribution is not None else {}
+                        ),
                     )
-                    torch_rel = torch.cat((torch_rel, tmp_rel), 0)
+                    torch_rel = torch.cat((torch_rel, tmp_rel.detach()), 0)
+
+                    del tmp_rel
 
         # Compute relevance for methods without a baseline
-        elif method_relevance in method_wo_baseline.keys():
-            rel_method = method_wo_baseline[method_relevance](self.model)
+        elif dict_method_arguments[method_relevance]["require_baseline"] == False:
+            rel_method = dict_method_arguments[method_relevance]["captum_method"]
+            rel_method = rel_method(self.model)
             if rel_method.has_convergence_delta():
                 for (sample, target_idx) in tqdm(
                     zip(batched_sample, batched_idx),
@@ -282,16 +326,21 @@ class ScoreComputation:
                     tmp_rel, delta = attribute_series_features(
                         rel_method,
                         self.model,
-                        torch.Tensor(sample.astype(np.float32)).squeeze(),
+                        torch.Tensor(sample.astype(np.float32)),
                         target_idx,
                         return_convergence_delta=True,
+                        **(
+                            kwargs_attribution if kwargs_attribution is not None else {}
+                        ),
                     )
-                    torch_rel = torch.cat((torch_rel, tmp_rel), 0)
+                    torch_rel = torch.cat((torch_rel, tmp_rel.detach()), 0)
 
                     if torch.sum(delta) > 0.1:
                         print(
                             f"Relevance delta for method {method_relevance} is {delta}"
                         )
+                    del tmp_rel
+                    del delta
             else:
                 for (sample, target_idx) in tqdm(
                     zip(batched_sample, batched_idx),
@@ -301,24 +350,29 @@ class ScoreComputation:
                     tmp_rel = attribute_series_features(
                         rel_method,
                         self.model,
-                        torch.Tensor(sample.astype(np.float32)).squeeze(),
+                        torch.Tensor(sample.astype(np.float32)),
                         target_idx,
+                        **(
+                            kwargs_attribution if kwargs_attribution is not None else {}
+                        ),
                     )
-                    torch_rel = torch.cat((torch_rel, tmp_rel), 0)
+                    torch_rel = torch.cat((torch_rel, tmp_rel.detach()), 0)
+
+                    del tmp_rel
 
         else:
             raise ValueError(
                 f"{method_relevance} \
                 is not available. Relevance method should be one of \
-               {methods_require_baseline.keys()} or {method_wo_baseline}  "
+               {dict_method_arguments.keys()}"
             )
 
-        np_rel = torch_rel.squeeze().cpu().detach().numpy()
+        np_rel = torch_rel.cpu().detach().numpy()
 
         # If channel first == true we convert to [batch, time-step, feature]
-        if self.config["MANIPULATION"]["channel_first"].lower() == "true":
-            print("converting to [batch, time-step, feature] format")
-            np_rel = np.transpose(np_rel, (0, 2, 1))
+
+        print("converting to [batch, time-step, feature] format")
+        np_rel = np.transpose(np_rel, (0, 2, 1))
 
         np_rel_df = np_rel.transpose((1, 0, 2)).reshape((np_rel.shape[1], -1))
         df_relevance = pd.DataFrame(np_rel_df)
@@ -332,68 +386,82 @@ class ScoreComputation:
             for idx in range(np_rel_df.shape[1])
         ]
         df_relevance.columns = names_columns
+        path_interp_raw = pj(self.save_results, "interpretability_raw")
+        if not os.path.exists(path_interp_raw):
+            os.makedirs(path_interp_raw)
 
         df_relevance.to_csv(
-            pj(self.save_results, f"intepretability_{method_relevance}.csv")
+            pj(path_interp_raw, f"intepretability_{method_relevance}.csv")
         )
         np.save(
-            pj(self.save_results, f"intepretability_{method_relevance}.npy"),
+            pj(path_interp_raw, f"intepretability_{method_relevance}.npy"),
             np_rel,
         )
+
+        if (lstm_network_bool) & (
+            dict_method_arguments[method_relevance]["noback_cudnn"]
+        ):
+            device = (
+                torch.device("cuda:0")
+                if torch.cuda.is_available()
+                else torch.device("cpu")
+            )
+            self.model.to(device)
+
         return df_relevance
 
     def compute_scores_wrapper(
-        self, quantiles, method_relevance, replacement_method, neg_relevance=False
+        self,
+        q_features: List[float],
+        method_relevance: str,
     ):
         """
-        Wrapper to compute metrics at all prescribed quantiles
+        Wrapper to compute metrics at all prescribed q_features
         Parameters
         ----------
-        quantiles: list
-            List of quantiles to compute
+        q_features: list
+            List of k_feature to compute
         method_relevance: str
             Interpretability method to compute metrics
-        replacement_method: str
-            Method to oclude samples one of ['normal','permutation']
         neg_relevance: bool
             If true, relevance is computed for negative relevance, else only consider positive relevance
         """
+        rel_method = dict_method_arguments[method_relevance]["captum_method"]
+        baseline_type = dict_method_arguments[method_relevance]["baseline_type"]
 
-        if replacement_method != "normal" and replacement_method != "permutation":
-            raise ValueError(
-                "Replacement method should be one of `normal` or `permutation`"
-            )
+        _, expected_value = self._return_baseline(baseline_type, self.baseline)
+        self.expected_value = expected_value
 
-        print(
-            f"Computing metrics using {method_relevance} and {replacement_method} alteration"
-        )
-        for quantile in quantiles:
-            _ = self.__compute_scores(
-                quantile, method_relevance, replacement_method, neg_relevance
-            )
+        print(f"Computing metrics using {method_relevance}")
+        for topk in [True, False]:
+            for k_feature in q_features:
+                _ = self.__compute_scores(
+                    k_feature,
+                    topk,
+                    method_relevance,
+                )
+        resave_score_rel_neg(self.save_results, method_relevance)
 
-    def create_summary(self, method_relevance, replacement_method):
+    def create_summary(self, method_relevance):
         """
         Function to create the summary of the results
         Parameters
         ----------
         method_relevance: str
             intepretability method of interest
-        replacement_method: str
-            replacement method of interest
         Returns
         -------
         df_results: pd.DataFrame
             dataframe with the summary of the results
 
         """
-        # Extract csv with results for all quantile
+        # Extract csv with results for all k_feature
         path_files = glob.glob(
             os.path.join(
                 self.save_results,
-                replacement_method,
-                f"interpretability_{method_relevance}__0*",
-                "results_interp.csv",
+                "results_k_feature",
+                f"interpretability_{method_relevance}__*",
+                "results_interp__*.csv",
             )
         )
 
@@ -405,24 +473,34 @@ class ScoreComputation:
             "delta_score1",
             "delta_score2",
             "metric_score",
-            "expert_score",
             "metric_score_random",
         ]
-        quantile = [float(x.split(os.sep)[-2].split("__")[-1]) for x in path_files]
-        df_results = pd.DataFrame(index=quantile, columns=required_columns)
+        q_features = [
+            float(re.search("[\d.]+$", tmp.split(os.sep)[-2]).group())
+            for tmp in path_files
+        ]
+        q_features = list(set(q_features))
+        # quantile = [float(x.split(os.sep)[-2].split("__")[-1]) for x in path_files]
+        df_results_top = pd.DataFrame(index=q_features, columns=required_columns)
+        df_results_bottom = pd.DataFrame(index=q_features, columns=required_columns)
         # Compute summary across each metric
         for idx, path in enumerate(path_files):
+            k_feature = float(re.search("[\d.]+$", path.split(os.sep)[-2]).group())
+
+            if k_feature != 1.0:
+                required_columns_all = required_columns + ["metric_normalised"]
+            else:
+                required_columns_all = required_columns
+
+            mask = re.search("(top|bottom)", path.split(os.sep)[-1]).group()
             df_quantile = pd.read_csv(path, index_col=0)
-            df_tmp = df_quantile.loc[:, required_columns]
+            df_tmp = df_quantile.loc[:, required_columns_all]
             df_tmp = pd.DataFrame(
                 np.where(np.isinf(df_tmp.values), np.nan, df_tmp.values),
                 index=df_tmp.index,
                 columns=df_tmp.columns,
             )
             df_tmp = df_tmp.dropna(axis=1, how="all")
-            df_results.loc[quantile[idx], df_tmp.columns] = np.nanmean(
-                df_tmp.values, axis=0
-            )
 
             df_accuracy = df_quantile.loc[
                 :,
@@ -432,49 +510,159 @@ class ScoreComputation:
                     "random_classification",
                 ],
             ]
-            df_results.loc[quantile[idx], df_accuracy.columns] = (
-                np.sum(df_accuracy, axis=0) / df_accuracy.shape[0]
-            )
+            if mask == "top":
+                df_results_top.loc[k_feature, df_accuracy.columns] = (
+                    np.sum(df_accuracy, axis=0) / df_accuracy.shape[0]
+                )
 
-        df_results.to_csv(
+                df_results_top.loc[k_feature, df_tmp.columns] = np.nanmean(
+                    df_tmp.values, axis=0
+                )
+            elif mask == "bottom":
+                df_results_bottom.loc[k_feature, df_accuracy.columns] = (
+                    np.sum(df_accuracy, axis=0) / df_accuracy.shape[0]
+                )
+
+                df_results_bottom.loc[k_feature, df_tmp.columns] = np.nanmean(
+                    df_tmp.values, axis=0
+                )
+
+        df_results_top.to_csv(
             os.path.join(
                 self.save_results,
-                replacement_method,
-                f"summary_relevance_{method_relevance}.csv",
+                f"summary_relevance_{method_relevance}__top.csv",
+            )
+        )
+        df_results_bottom.loc[:, "metric_score"] = df_results_bottom.loc[
+            :, "metric_score"
+        ].clip(lower=0)
+        df_results_bottom.to_csv(
+            os.path.join(
+                self.save_results,
+                f"summary_relevance_{method_relevance}__bottom.csv",
             )
         )
 
-    def __compute_scores(
-        self, quantile, method_relevance, replacement_method, neg_relevance
-    ):
-        """
-        Compute metrics at a given quantile
+    def _return_baseline(
+        self, type_baseline: str, signal: Union[np.array, torch.Tensor]
+    ) -> torch.tensor:
+        """Function to return baseline
         Parameters
         ----------
-        quantile: float
-            Quantile to compute metrics at
+        type_baseline : str
+            Type of baseline to be used. One of ["zeros", "random", "mean", "sample"]
+        signal : np.array
+            Signal to be used to compute baseline.
+        Returns
+        -------
+        Baseline: np.array
+        """
+        s = signal.copy()
+        if not isinstance(s, torch.Tensor):
+            s = torch.tensor(s)
+        self.model.to(device)
+        nb_sample = min(signal.shape[0], 50)
+        if type_baseline == "zeros":
+            # return baseline as zeros
+            baseline = torch.zeros(s[:1].shape)
+            expected_value = (
+                self.model(baseline.type(torch.float32).to(device))
+                .detach()
+                .cpu()
+                .numpy()
+            )
+        elif type_baseline == "random":
+            # return baseline as random values
+            baseline = torch.normal(mean=0, std=1, size=s[:1].shape)
+            expected_value = (
+                self.model(baseline.type(torch.float32).to(device))
+                .detach()
+                .cpu()
+                .numpy()
+            )
+        elif type_baseline == "mean":
+            # return baseline as mean of signal
+            baseline = torch.mean(s, dim=0)
+            expected_value = (
+                self.model(baseline[None].type(torch.float32).to(device))
+                .detach()
+                .cpu()
+                .numpy()
+            )
+        elif type_baseline == "sample":
+
+            if "sample_baseline.npy" in os.listdir(self.save_results):
+                print("Loading baseline from file")
+                baseline = np.load(pj(self.save_results, "sample_baseline.npy"))
+                baseline = torch.tensor(baseline)
+            else:
+                print("Extracting baseline samples")
+                # return baseline as sample of given size of signal
+                idx_random = np.random.permutation(np.arange(s.shape[0]))
+                idx_random = idx_random[:nb_sample]
+                baseline = s[idx_random]
+                np.save(pj(self.save_results, "sample_baseline.npy"), baseline)
+
+            batched_signal = np.array_split(baseline, np.ceil(baseline.shape[0] / 16))
+            pred = torch.tensor([], device=device)
+            for sample in batched_signal:
+                with torch.no_grad():
+                    pred = torch.cat(
+                        (
+                            pred,
+                            self.model(sample.type(torch.float32).to(device)),
+                        ),
+                        0,
+                    )
+                del sample
+
+            # option 1: mean of the prediction on the whole dataset
+            expected_value = pred.mean(axis=0).detach().cpu().numpy()
+
+        baseline = baseline.type(torch.float32)
+        if baseline.ndim == 2:
+            baseline = baseline[None, :, :]
+
+        return baseline, expected_value
+
+    def __compute_scores(
+        self,
+        k_feature: float,
+        topk: bool,
+        method_relevance: str,
+    ):
+        """
+        Compute metrics at a given k_feature
+        Parameters
+        ----------
+        k_feature : float
+            Proportion (top or bottom) of features to be used.
+        topk: bool
+            Whether to use top (True) or bottom (False) k features.
         method_relevance: str
             Interpretability method to compute metrics
-        replacement_method: str
-            Method to oclude samples one of ['normal','permutation']
-        neg_relevance: bool
-            If true, relevance is computed for negative relevance, else only consider positive relevance
+
         Returns
         -------
         df_results: pd.DataFrame
             Dataframe containing metrics
         """
 
+        string_mask = "top" if topk else "bottom"
         path_save = pj(
             self.save_results,
-            replacement_method,
-            f"interpretability_{method_relevance}__{quantile:.2f}",
+            "results_k_feature",
+            f"interpretability_{method_relevance}__{k_feature:.2f}",
         )
         if not os.path.exists(path_save):
             os.makedirs(path_save)
 
         df_rel = pd.read_csv(
-            pj(self.save_results, f"intepretability_{method_relevance}.csv")
+            pj(
+                self.save_results,
+                "interpretability_raw",
+                f"intepretability_{method_relevance}.csv",
+            )
         )
         df_results = pd.DataFrame()
         np_all_modified_signal = np.empty(self.np_signal.shape)
@@ -482,7 +670,7 @@ class ScoreComputation:
 
         # Iterate across all samples to compute metrics
         for idx in tqdm(range(self.np_signal.shape[0])):
-            target_encoded = self.target_encoded[idx]
+            pred_idx = self.pred_idx[idx]
             name_sample = self.list_sample_names[idx]
             signal_names = self.list_signal_names[idx]
             signal = self.np_signal[idx, :, :].copy()
@@ -495,24 +683,23 @@ class ScoreComputation:
             if interp.shape[1] > self.nb_features:
                 raise ValueError(
                     f"""
-                    Interp dataframe shape {interp.shape[1]} 
+                    Interp dataframe shape {interp.shape[1]}
                     is larger than nb feature {self.nb_features}"""
                 )
             if interp.shape[1] == 0 or interp[interp >= 0].shape[0] == 0:
                 continue
 
-            class_name = self.encoder.inverse_transform(target_encoded.reshape(1, -1))
+            class_name = self.encoder.inverse_transform(pred_idx.reshape(1, -1))
             dict_results = self.__interpretability_metrics(
-                signal=signal,
                 idx_sample=idx,
+                signal=signal,
                 name_sample=name_sample,
                 signal_names=signal_names,
-                target_encoded=target_encoded,
+                pred_idx=pred_idx,
                 interp=interp,
                 path_save=path_save,
-                quantile=quantile,
-                replacement_method=replacement_method,
-                neg_relevance=neg_relevance,
+                k_feature=k_feature,
+                topk=topk,
             )
 
             dict_summary = {
@@ -523,10 +710,10 @@ class ScoreComputation:
                 "median_Rx": np.median(interp),
                 "mean_n_pts_removed": dict_results["n_pts_removed"].mean(),
                 "mean_ratio_pts_removed": dict_results["ratio_pts_removed"].mean(),
-                "sum_rel_removed": dict_results["sum_rel_removed"],
                 "mean_tic": dict_results["tic"].mean(),
                 "sample_expected_values": dict_results["sample_expected_values"],
-                "expert_score": dict_results["expert_score"].mean(),
+                "sum_rel_neg": dict_results["sum_rel_neg"],
+                "sum_rel_pos": dict_results["sum_rel_pos"],
             }
 
             df_tmp = pd.DataFrame(dict_summary, index=[name_sample])
@@ -548,41 +735,43 @@ class ScoreComputation:
 
         df_results = df_results.sort_index()
 
-        df_results.to_csv(pj(path_save, "results_interp.csv"))
+        df_results.to_csv(pj(path_save, f"results_interp__{string_mask}.csv"))
         return df_results
 
     def __interpretability_metrics(
         self,
-        idx_sample,
-        signal,
-        name_sample,
-        signal_names,
-        target_encoded,
-        interp,
-        path_save,
-        quantile,
-        replacement_method,
-        neg_relevance,
+        idx_sample: int,
+        signal: np.ndarray,
+        name_sample: str,
+        signal_names: List[str],
+        pred_idx: np.ndarray,
+        interp: np.array,
+        path_save: str,
+        k_feature: float,
+        topk: bool,
     ):
         """
         Function to compute interpretability metrics based on positive relevance
         ----------
-        signal: np.array
-            signal to be interpreted
         idx_sample: int
             idx of the current sample used to plot only given sample
+        signal: np.array
+            signal to be interpreted
         name_sample: str
             name of the sample
         signal_names: list
             list of signal names
-        target_encoded: numpy array
-            target encoded
+        pred_idx: numpy array
+            pred model encoded
         interp: numpy array
             relevance scores
         path_save: str
             path to save results
-        quantile: float
-            quantile to be used
+        k_feature: float
+            determine the  k (top or bottom) features to be used
+        topk: bool
+            determine wheter top (True) or bottom (False) k features are used
+
         ----------
 
         Returns:
@@ -593,7 +782,6 @@ class ScoreComputation:
             tic: Time Information Content
             n_pts_removed: number of points removed
             ratio_pts_removed: ratio of points removed
-            expert_score: ratio of weighted rel with expert weights vs. rel within quantile
             sum_rel_removed: sum of rel removed
             sample_expected_values: expected value of the sample
             modified_signal: numpy array
@@ -603,81 +791,54 @@ class ScoreComputation:
         ----------------
         """
 
-        data_path = os.path.expanduser(self.config["CONFIGURATION"]["data_path"])
-        path_weight = os.path.abspath(
-            os.path.join(data_path, f"../expert_weights/{name_sample}.csv")
-        )
-
-        # load expert weights if they exist
-        if os.path.exists(path_weight):
-            df_weights = pd.read_csv(
-                os.path.join(path_weight), index_col=0
-            ).reset_index(drop=True)
-            if df_weights.shape[1] == 0:
-                df_weights = pd.DataFrame(np.full(signal.shape, np.nan))
-        else:
-            df_weights = pd.DataFrame(np.full(signal.shape, np.nan))
-
         epsilon = 1e-12
 
         frac_pts_rel = np.zeros(interp.shape[1])
+        mean_windows_rel = np.zeros(
+            interp.shape[1]
+        )  # mean len continuous windows with rel>quantile
         tic = np.zeros(interp.shape[1])
-        expert_score = np.zeros(interp.shape[1])
 
         n_pts_removed = np.zeros(interp.shape[1])
         ratio_pts_removed = np.zeros(interp.shape[1])
 
-        if neg_relevance:
-            # Consider case where we are interested in negative relevance
-            sn_interp_all = interp[interp < 0]
-            if sn_interp_all.shape[0] > 0:
-                sn_interp_q = np.quantile(sn_interp_all, 1 - quantile)
-            else:
-                sn_interp_q = -1e-8
-            sn_interp_all = interp[interp < 0]
-            thres_p = sn_interp_q
+        sum_rel_neg = interp[interp < 0].sum()
+        sum_rel_pos = interp[interp >= 0].sum()
+        # Case interested in positive relevance
+        sp_interp_all = interp[interp >= 0]
+        if sp_interp_all.shape[0] == 0:
+            breakpoint()
 
-            # In case we are intereseted in evaluating impact negative relevance we cannot start
-            # from initial signal, our "baseline" signal is therefore the signal with half of the
-            # positive relevance corrupted
-            signal = pd.DataFrame(signal)
-            median_p = np.median(interp[interp > 0])  # median of the positive relevance
-            for coord in range(signal.shape[1]):
-                s = signal.iloc[:, coord]
-                df_i = pd.Series(interp[:, coord])
-                df_i = df_i.loc[df_i > median_p]
-                val_above = s[df_i.index]
-                shuffled_array = val_above.values.copy()
-                np.random.shuffle(shuffled_array)
-                s.loc[df_i.index] = shuffled_array
-                signal.iloc[:, coord] = s
-
-            modified_signal = signal.copy()
-            randomly_modified_signal = signal.copy()
-
+        if topk:
+            # get top k features
+            quantile = 1 - k_feature
+            thres_p = np.quantile(sp_interp_all, quantile)
         else:
-            # Case interested in positive relevance
-            sp_interp_all = interp[interp >= 0]
-            if sp_interp_all.shape[0] == 0:
-                breakpoint()
-            sp_interp_q = np.quantile(sp_interp_all, quantile)
-            thres_p = sp_interp_q
+            # get bottom k features
+            quantile = k_feature
+            thres_p = np.quantile(sp_interp_all, quantile)
 
-            signal = pd.DataFrame(signal)
-            modified_signal = signal.copy()
-            randomly_modified_signal = signal.copy()
+        signal = pd.DataFrame(signal)
+        modified_signal = signal.copy()
+        randomly_modified_signal = signal.copy()
 
         for coord in range(signal.shape[1]):
-            weight_tmp = df_weights.iloc[:, coord]
-            # calculate quantile for function bounds
+
             s = signal.loc[:, coord]
             s_interp = pd.Series(interp[:, coord].copy())
-            if neg_relevance:
-                sp_interp = s_interp[s_interp < 0]
-                sp_tmp = sp_interp[sp_interp <= thres_p]
-            else:
-                sp_interp = s_interp[s_interp >= 0]
+
+            sp_interp = s_interp[s_interp >= 0]
+            if topk:
                 sp_tmp = sp_interp[sp_interp >= thres_p]
+            else:
+                sp_tmp = sp_interp[sp_interp <= thres_p]
+
+            grouped_index = mit.consecutive_groups(sp_tmp.index.values)
+            window_len = np.array([len(list(x)) for x in grouped_index])
+            mean_windows_rel[coord] = (
+                np.nanmean(window_len) if len(window_len) > 0 else 0
+            )
+            mean_windows_rel[coord] = max(1, mean_windows_rel[coord])
 
             if sp_tmp.shape[0] == 0:
                 frac_pts_rel[coord] = 0
@@ -688,9 +849,6 @@ class ScoreComputation:
                 # statistical quantities positive
                 sp_interp_var = np.var(sp_interp)
 
-                # sp_interp_q = np.quantile(sp_interp, quantile)
-                # thres_p = sp_interp_q
-
                 if sp_interp_var < 1e-8:
                     frac_pts_rel[coord] = 0
                 else:
@@ -700,7 +858,6 @@ class ScoreComputation:
 
                 if sp_tmp.shape[0] < 1:
                     tic[coord] = 0
-                    # expert_score[coord] = 0
                 else:
                     tic[coord] = integrate.simpson(sp_tmp) / (
                         integrate.simpson(sp_interp) + epsilon
@@ -709,55 +866,25 @@ class ScoreComputation:
                 n_pts_removed[coord] = sp_tmp.shape[0]
                 ratio_pts_removed[coord] = n_pts_removed[coord] / s.shape[0]
 
-            sp_interp2 = s_interp[s_interp > 0].copy()
-            weights_p = weight_tmp.loc[sp_interp2.index]
-            count_w = len(weights_p[weights_p > 0])
-            count_r = len(sp_interp2)
-            count_total = len(s_interp)
-            diff_wr = count_w - count_r
-            diff_wr = np.max([0, diff_wr])
-            ratio = np.sum(sp_interp2 * weights_p) / sum(sp_interp2)
-            expert_score[coord] = ratio * (1 - diff_wr / count_total)
-
-            if replacement_method == "normal":
-                modified_signal.loc[sp_tmp.index, coord] = (
-                    np.random.normal(scale=1 / np.sqrt(3), size=sp_tmp.shape[0]) * 0.5
-                )
-            elif replacement_method == "permutation":
-                shuffled_array = s[sp_tmp.index].values.copy()
-                np.random.shuffle(shuffled_array)
-                modified_signal.loc[sp_tmp.index, coord] = shuffled_array
-
-        if replacement_method == "normal":
-            randomly_modified_signal = randomly_modified_signal.values.reshape(-1)
-            idx_random = np.random.permutation(
-                np.arange(randomly_modified_signal.shape[0])
-            )
-            randomly_modified_signal[idx_random[: int(n_pts_removed.sum())]] = (
-                np.random.normal(scale=1 / np.sqrt(3), size=int(n_pts_removed.sum()))
-                * 0.5
+            modified_signal.loc[sp_tmp.index, coord] = np.random.normal(
+                scale=1, size=sp_tmp.shape[0]
             )
 
-            randomly_modified_signal = pd.DataFrame(
-                randomly_modified_signal.reshape(signal.shape)
-            )
+        drop_prob = n_pts_removed.sum() / np.cumprod(signal.shape)[-1]
+        block_size = round(np.nanmean(np.array(mean_windows_rel)))
 
-        elif replacement_method == "permutation":
-            col = np.random.randint(
-                0, high=signal.shape[1], size=int(n_pts_removed.sum())
-            )
-            val, count = np.unique(col, return_counts=True)
-            for idx, col_nb in enumerate(val):
-                nb_item = count[idx]
-                random_idx = np.random.permutation(np.arange(s.shape[0]))[:nb_item]
-                shuffled_array_random = randomly_modified_signal.loc[
-                    random_idx, col_nb
-                ].values.copy()
-                np.random.shuffle(shuffled_array_random)
-                randomly_modified_signal.loc[random_idx, col_nb] = shuffled_array_random
+        randomly_modified_signal = random_block_enforce_proba(
+            torch.tensor(randomly_modified_signal.values.T[np.newaxis, :]),
+            drop_prob=drop_prob,
+            block_size=block_size,
+        )
+
+        randomly_modified_signal = randomly_modified_signal.detach().numpy()
+        randomly_modified_signal = randomly_modified_signal[0].T
+        randomly_modified_signal = pd.DataFrame(randomly_modified_signal)
 
         if self.plot_signal > 0 and idx_sample % self.plot_signal == 0:
-            _plot_signal(
+            plot_corrupted_signal(
                 signal,
                 modified_signal,
                 randomly_modified_signal,
@@ -765,23 +892,17 @@ class ScoreComputation:
                 path_save,
                 signal_names,
                 name_sample,
+                topk,
             )
             # ------------------------------------------------------
-        if neg_relevance:
-            sum_rel_removed = interp[interp <= thres_p].sum()
-        else:
-            sum_rel_removed = interp[interp >= thres_p].sum()
 
-        if self.config["MANIPULATION"]["channel_first"].lower() == "true":
-            # We return value in correct order for model
-            modified_signal = np.transpose(modified_signal.values, (1, 0))
-            randomly_modified_signal = np.transpose(
-                randomly_modified_signal.values, (1, 0)
-            )
+        # sum_rel_removed = interp[interp >= thres_p].sum()
 
-        sample_expected_values = self.expected_value * np.asarray(
-            target_encoded.reshape(-1)
-        )
+        # We return value in correct order for model that is with [feat, sequence]
+        modified_signal = np.transpose(modified_signal.values, (1, 0))
+        randomly_modified_signal = np.transpose(randomly_modified_signal.values, (1, 0))
+
+        sample_expected_values = self.expected_value * np.asarray(pred_idx.reshape(-1))
         sample_expected_values = sample_expected_values[sample_expected_values != 0][0]
 
         dict_results = {
@@ -789,11 +910,11 @@ class ScoreComputation:
             "tic": tic,
             "n_pts_removed": n_pts_removed,
             "ratio_pts_removed": ratio_pts_removed,
-            "expert_score": expert_score,
-            "sum_rel_removed": sum_rel_removed,
             "sample_expected_values": sample_expected_values,
             "modified_signal": modified_signal,
             "randomly_modified_signal": randomly_modified_signal,
+            "sum_rel_neg": sum_rel_neg,
+            "sum_rel_pos": sum_rel_pos,
         }
         return dict_results
 
@@ -811,9 +932,10 @@ class ScoreComputation:
         Returns
         -------
         df_score: pd.DataFrame
-            dataframe with the score of the prediction on the initial and modified signal as well as diff and metric_score metric
+            dataframe with the score of the prediction on the initial and
+            modified signal as well as diff and metric_score metric
         """
-
+        self.model.to(device)
         required_columns = [
             "score1",
             "score2",
@@ -831,45 +953,32 @@ class ScoreComputation:
         batched_sample = np.array_split(
             self.np_signal, np.ceil(self.np_signal.shape[0] / batch_size)
         )
-        score1 = torch.tensor([], device=device, requires_grad=False)
-        for sample in batched_sample:
-            with torch.no_grad():
-                score1 = torch.cat(
-                    (
-                        score1,
-                        self.model(
-                            torch.Tensor(sample.astype(np.float32)).to(device).squeeze()
-                        ),
-                    ),
-                    0,
-                )
-
-        correct_classification = score1.argmax(
-            dim=1
-        ).detach().cpu().numpy() == np.argmax(self.target_encoded, axis=1)
-        score1 = score1.detach().cpu().numpy() * np.asarray(self.target_encoded)
+        score1 = self.score_pred
+        correct_classification = np.argmax(score1, axis=1) == np.argmax(
+            self.target_encoded, axis=1
+        )
+        score1 = score1 * np.asarray(self.pred_idx)
         df_score.loc[:, "score1"] = np.array([x[x != 0][0] for x in score1])
         df_score.loc[:, "initial_classification"] = correct_classification
 
         batched_sample = np.array_split(
             np_all_modified_signal, np.ceil(self.np_signal.shape[0] / batch_size)
         )
+
         score2 = torch.tensor([], device=device, requires_grad=False)
         for sample in batched_sample:
             with torch.no_grad():
                 score2 = torch.cat(
                     (
                         score2,
-                        self.model(
-                            torch.Tensor(sample.astype(np.float32)).to(device).squeeze()
-                        ),
+                        self.model(torch.Tensor(sample.astype(np.float32)).to(device)),
                     ),
                     0,
                 )
         correct_classification = score2.argmax(
             dim=1
         ).detach().cpu().numpy() == np.argmax(self.target_encoded, axis=1)
-        score2 = score2.detach().cpu().numpy() * np.asarray(self.target_encoded)
+        score2 = score2.detach().cpu().numpy() * np.asarray(self.pred_idx)
         df_score.loc[:, "score2"] = np.array([x[x != 0][0] for x in score2])
         df_score.loc[:, "modified_classification"] = correct_classification
 
@@ -883,19 +992,14 @@ class ScoreComputation:
                 score3 = torch.cat(
                     (
                         score3,
-                        self.model(
-                            torch.Tensor(sample.astype(np.float32))
-                            .to(device)
-                            .squeeze()
-                            .squeeze()
-                        ),
+                        self.model(torch.Tensor(sample.astype(np.float32)).to(device)),
                     ),
                     0,
                 )
         correct_classification = score3.argmax(
             dim=1
         ).detach().cpu().numpy() == np.argmax(self.target_encoded, axis=1)
-        score3 = score3.detach().cpu().numpy() * np.asarray(self.target_encoded)
+        score3 = score3.detach().cpu().numpy() * np.asarray(self.pred_idx)
         df_score.loc[:, "score3"] = np.array([x[x != 0][0] for x in score3])
         df_score.loc[:, "random_classification"] = correct_classification
 
@@ -906,20 +1010,20 @@ class ScoreComputation:
 
         # ------------------------------------------------------
         # compute score drop
+
         df_score.loc[:, "delta_score1"] = (
             df_score.loc[:, "score1"] - df_score.loc[:, "score2"]
         )
         df_score.loc[:, "delta_score2"] = (
             df_score.loc[:, "score1"] - df_score.loc[:, "score3"]
         )
-        metric_score = 1 - (df_score.loc[:, "score2"] - sample_expected_values) / (
-            df_score.loc[:, "score1"] - sample_expected_values
+
+        metric_score = df_score.loc[:, "delta_score1"] / df_score.loc[:, "score1"]
+        metric_score_random = (
+            df_score.loc[:, "delta_score2"] / df_score.loc[:, "score1"]
         )
-        metric_score_random = 1 - (
-            df_score.loc[:, "score3"] - sample_expected_values
-        ) / (df_score.loc[:, "score1"] - sample_expected_values)
-        df_score.loc[:, "metric_score"] = np.clip(metric_score, -1, 1)
-        df_score.loc[:, "metric_score_random"] = np.clip(metric_score_random, -1, 1)
+        df_score.loc[:, "metric_score"] = metric_score
+        df_score.loc[:, "metric_score_random"] = metric_score_random
 
         del score1
         del score2
@@ -927,166 +1031,12 @@ class ScoreComputation:
 
         return df_score
 
-    def __init_samples(self):
+    def summarise_results(self):
         """
-        Function to initialize the samples, models as well as different parameters required for the analysis
+        Function to summarise the results from all interpretability methods
         """
-
-        # Find config file used for the simulations
-        res = [
-            f
-            for f in os.listdir(self.results_path)
-            if re.search(r"config[a-zA-Z0-9_]+(.yaml|.xml)", f)
-        ]
-        fc = os.path.abspath(os.path.join(self.results_path, res[0]))
-
-        for file in glob.glob(fc):
-            print("file [fc] = ", file)
-            config_file = os.path.abspath(file)
-
-        self.config = utils_data.parse_config(config_file)
-        trainer = Trainable(self.config, self.results_path, retrieve_model=True)
-        self.model = trainer.train(self.config["MODEL"]).to(device).eval()
-        df_test = pd.read_csv(
-            os.path.join(self.results_path, "results", "results_test.csv")
-        )
-
-        if self.names == None:
-            names_sample = df_test.noun_id.values.tolist()
-            self.names = names_sample
-            length_set = len(names_sample)
-
-        else:
-            names_sample = set(df_test.noun_id.values.tolist() + self.names)
-            length_set = len(names_sample)
-
-        ml_data = ML_Dataset(self.config)
-        self.encoder = generate_encoder(ml_data, self.results_path)
-        ml_data.encoder = self.encoder
-        ml_data.evaluate_nb_features()
-        self.nb_features = ml_data.n_features
-        if self.config["MANIPULATION"].get("feature_scaling", "none").lower() != "none":
-            ml_data.generate_scaler()
-
-        # Fields to be loaded from the dataset
-        all_fields = [
-            ml_data.featureName,
-            ml_data.targetName,
-            "noun_id",
-            "signal_names",
-        ]
-        count_large = 0
-        target_encoded_all = []
-        list_signal_names = []
-        list_sample_names = []
-        with ml_data.retrieve_sample(
-            names_sample, fields=all_fields
-        ) as reader_filtered:
-            for idx, sample in enumerate(reader_filtered):
-                if idx == 0:
-                    np_signal = np.zeros(
-                        [length_set, sample.signal.shape[0], sample.signal.shape[1]]
-                    )
-                np_signal[idx, :, :] = sample.signal.astype(np.float32)
-                list_sample_names.append(np.array(sample.noun_id).astype(str).tolist())
-                target_encoded_all.append(getattr(sample, ml_data.targetName))
-                list_signal_names.append(
-                    np.array(sample.signal_names).astype(str).tolist()
-                )
-        # make sure that we remove the lines with zeros created initially in the array
-        np_signal = np_signal[: len(list_sample_names)]
-        name_not_in_list = [x for x in self.names if x not in list_sample_names]
-        if len(name_not_in_list) != 0:
-            print(f"{name_not_in_list} in name array are not included in the test set")
-            self.names = list(set(self.names) - set(name_not_in_list))
-        index_to_explain = np.where(np.isin(list_sample_names, self.names))
-        self.np_signal = np_signal[index_to_explain]
-
-        # ------------------------------------------------------
-        # define expected value of the networs with different options
-
-        batched_signal = np.array_split(np_signal, np.ceil(np_signal.shape[0] / 8))
-        pred = torch.tensor([], device=device)
-        for sample in batched_signal:
-            with torch.no_grad():
-                pred = torch.cat(
-                    (
-                        pred,
-                        self.model(
-                            torch.Tensor(sample.astype(np.float32)).to(device).squeeze()
-                        ),
-                    ),
-                    0,
-                )
-
-        # option 1: mean of the prediction on the whole dataset
-        self.expected_value = pred.mean(axis=0).detach().cpu().numpy()
-
-        # option 2: mean of the prediction on random samples
-        # np_random = self.np_signal.copy().reshape(-1)
-        # np_random[:] = np.random.normal(scale=1 / np.sqrt(3), size=int(np_random.shape[0])) * 0.5
-        # np_random = np_random.reshape(np_signal.shape)
-        # self.expected_value = self.model(torch.tensor(np_random[:50].astype(np.float32)).to(device)).mean(axis=0).detach().cpu().numpy()
-
-        # option 3: mean of the prediction on the whole dataset but after multiplication by the target class and excluding 0
-        # tmp =pred.detach().cpu().numpy() *np.array(target_encoded_all)
-        # tmp[tmp ==0]=np.NaN
-        # self.expected_value = np.nanmean(tmp,axis =0)
-        #
-        # get clean signals
-        self.baseline = self.np_signal.copy()
-        self.target_encoded = np.array(target_encoded_all)[index_to_explain]
-        self.list_sample_names = np.array(list_sample_names)[index_to_explain].tolist()
-        self.list_signal_names = np.array(list_signal_names)[index_to_explain].tolist()
-
-    @staticmethod
-    def plot_summary_results(save_results, replacement_method):
-        """
-        Static method to create plot summarising the results of the analysis for the different interpretability methods
-        Parameters
-        ----------
-        save_results: str
-            path to the folder where the results are stored
-        replacement_method: str
-            name of the method used to occlude the features
-
-        Returns
-        -------
-        None
-        """
-        import matplotlib.colors as mcolors
-        import matplotlib.ticker as plticker
-        import seaborn as sns
-
-        color_s = sns.color_palette("tab10", 7)
-        name_method_dict = {
-            "gradshap": {"name": "GradSHAP", "color": color_s[0], "linestyle": "-o"},
-            "integrated_gradients": {
-                "name": "Integrated Gradient",
-                "color": color_s[1],
-                "linestyle": "--o",
-            },
-            "shapleyvalue": {
-                "name": "Shapley Sampling",
-                "color": color_s[2],
-                "linestyle": "-.o",
-            },
-            "deeplift": {"name": "DeepLIFT", "color": color_s[3], "linestyle": ":o"},
-            "saliency": {"name": "Saliency", "color": color_s[4], "linestyle": "-o"},
-            "kernelshap": {
-                "name": "KernelSHAP",
-                "color": color_s[5],
-                "linestyle": "--o",
-            },
-            "shapley_sampling": {
-                "name": "Shapley Sampling",
-                "color": color_s[6],
-                "linestyle": "-.o",
-            },
-        }
-
         path_summary = glob.glob(
-            os.path.join(save_results, replacement_method, "summary_relevance_*.csv")
+            os.path.join(self.save_results, "summary_relevance_*.csv")
         )
         results_all = {}
         for path in path_summary:
@@ -1096,317 +1046,135 @@ class ScoreComputation:
             results_all[method] = df_results
         df_metrics = compute_summary_metrics(results_all)
         df_metrics.to_csv(
-            os.path.join(save_results, replacement_method, "metrics_methods.csv")
+            os.path.join(self.save_results, "metrics_methods.csv")
         )
-        fig = plt.figure(figsize=(15, 5))
-        width_ratios = [0.33, 0.33, 0.33]
-        gridspec = GridSpec(ncols=3, nrows=1, figure=fig, width_ratios=width_ratios)
 
-        # plot 0
-        ax0 = plt.subplot(gridspec[0])
-        ax1 = plt.subplot(gridspec[1])
-        ax2 = plt.subplot(gridspec[2])
+        return True
 
-        ax0.set_xlabel("$\\tilde{N}_{\\mathrm{r}}$")
-        ax0.set_ylabel("$\\tilde{S}_{\\mathbb{E}}$")
+    def __init_samples(self):
+        """
+        Function to initialize the samples, models as well as
+        different parameters required for the analysis
+        """
 
-        ax1.set_xlabel("TIC")
-        ax1.set_ylabel("$\\tilde{S}_{\\mathbb{E}}$")
+        # Find config file used for the simulations
+        res = [
+            f
+            for f in os.listdir(self.model_path)
+            if re.search(r"config[a-zA-Z0-9_]+(.yaml|.xml)", f)
+        ]
+        fc = os.path.abspath(os.path.join(self.model_path, res[0]))
 
-        ax2.set_xlabel("$\\tilde{N}_{\\mathrm{r}}$")
-        ax2.set_ylabel("Accuracy")
-        ax0.set_xlim([0, 1])
-        ax1.set_xlim([0, 1])
-        ax0.set_ylim(bottom=0)
-        ax1.set_ylim(bottom=0)
-        loc = plticker.MultipleLocator(
-            base=0.2
-        )  # this locator puts ticks at regular intervals
-        ax0.yaxis.set_major_locator(loc)
-        ax1.yaxis.set_major_locator(loc)
-        ax2.set_xlim([0, 1])
+        for file in glob.glob(fc):
+            print("file [fc] = ", file)
+            config_file = os.path.abspath(file)
 
-        legend_handles = []
-        for idx, key in enumerate(results_all.keys()):
-            if key in name_method_dict.keys():
-                name_method = name_method_dict[key]["name"]
-                color_method = name_method_dict[key]["color"]
-                linestyle_method = name_method_dict[key]["linestyle"]
-            else:
-                name_method = key
-            df_tmp = results_all[key]
-            df_tmp = df_tmp.sort_index()
-            quantile = df_tmp.index
-            tmp = ax0.plot(
-                # quantile,
-                df_tmp.loc[:, "mean_ratio_pts_removed"],
-                # (df_tmp.loc[:, "delta_score1"] / df_tmp.loc[:, "score1"]),
-                df_tmp.loc[:, "metric_score"],
-                "-o",
-                color=color_method,
-                label=f"{name_method}",
-            )
-            legend_handles.append(tmp[0])
-            ax1.plot(
-                df_tmp.loc[:, "mean_tic"],
-                df_tmp.loc[:, "metric_score"],
-                "-o",
-                color=color_method,
-                label=f"{name_method}",
-            )
-
-            ax2.plot(
-                df_tmp.loc[:, "mean_ratio_pts_removed"],
-                df_tmp.loc[:, "modified_classification"],
-                "-o",
-                color=color_method,
-                label=f"{name_method}",
-            )
-
-            if key == "saliency":
-                tmp = ax0.plot(
-                    # quantile,
-                    df_tmp.loc[:, "mean_ratio_pts_removed"],
-                    #    (df_tmp.loc[:, "delta_score2"] / df_tmp.loc[:, "score1"]),
-                    df_tmp.loc[:, "metric_score_random"],
-                    "-o",
-                    color="black",
-                    label="Random",
-                )
-                legend_handles.append(tmp[0])
-
-                tmp = ax1.plot(
-                    np.linspace(start=0.0, stop=0.95, num=20),
-                    np.linspace(start=0.0, stop=0.95, num=20),
-                    color="black",
-                    linestyle="--",
-                    label="Theoretical estimation",
-                )
-                legend_handles.append(tmp[0])
-                ax2.plot(
-                    # quantile,
-                    df_tmp.loc[:, "mean_ratio_pts_removed"],
-                    df_tmp.loc[:, "random_classification"],
-                    "-o",
-                    color="black",
-                    label="Random",
-                )
-            ax0.legend(
-                handles=legend_handles, bbox_to_anchor=(-0.3, 1.0), loc="upper right"
-            )
-        plt.tight_layout()
-        fig_path = os.path.join(
-            save_results, replacement_method, "visualization_results"
+        self.config = utils_data.parse_config(config_file)
+        self.config["CONFIGURATION"]["data_path"] = pj(
+            data_path, self.config["CONFIGURATION"]["data_path"]
         )
-        if not os.path.exists(fig_path):
-            os.makedirs(fig_path)
-        plt.savefig(os.path.join(fig_path, "score_mean.png"), dpi=200)
-        plt.close()
+        trainer = Trainable(self.config, self.model_path, retrieve_model=True)
+        model = trainer.train(self.config["MODEL"]).to(device).eval()
+        if self.model_output == "probabilities":
+            print("Model output is probability")
+            self.model = nn.Sequential(model, nn.Softmax(dim=-1)).eval()
+        elif self.model_output == "logits":
+            self.model = model
+            print("Model output is logits")
+        else:
+            raise ValueError("Model_output must be either probability or logits")
 
+        df_test = pd.read_csv(
+            os.path.join(self.model_path, "results", "results_test.csv")
+        )
 
-def generate_encoder(ml_data, simulation_path):
-    """
-    Generate the encoder for the data.
-    Parameters
-    ----------
-    ml_data:
-        ml_data class for the simulations
-    simulation_path:
-        path to the simulation
-    Returns
-    -------
-    encoder:
-        encoder for the data
-    """
+        if self.names == None:
+            names_sample = df_test.noun_id.values.tolist()
+            self.names = names_sample
+            length_set = len(names_sample)
 
-    classes = np.load(
-        os.path.join(simulation_path, "classes_encoder.npy"), allow_pickle=True
-    )
-    with ml_data.create_reader(schema_fields=[ml_data.targetName]) as reader:
-        target_dataset = [l[0] for l in reader]
-        if np.array(target_dataset).dtype.type is np.string_:
-            target_dataset = np.array(target_dataset).astype(str)
-        if ml_data.selected_classes != None and "all" not in ml_data.selected_classes:
-            print(f"Selecting only {ml_data.selected_classes}")
-            tmp = [reduce(lambda i, j: np.concatenate((i, j)), target_dataset)]
-            unique = set(tmp[0])
-            ml_data.list_remove = [
-                x for x in unique if x not in ml_data.selected_classes
-            ]
-            target_dataset = [
-                np.setdiff1d(x, ml_data.list_remove) for x in target_dataset
-            ]
-            # target_dataset = [np.zeros(1).astype(int) \
-            #  if x.shape[0] ==0 else x.astype(int) for x in new_target ]
-        if ml_data.config["MANIPULATION"]["target_encoding"] == "one_hot_encoder":
-            classes = [np.array([x.replace("x0_", "") for x in classes.astype(str)])]
-            encoder = preprocessing.OneHotEncoder(categories=classes)
-            if isinstance(target_dataset, list):
-                # we want to deal with case where we onehot encode a list of labels
-                target_dataset = np.array(
-                    [",".join(x.astype(str).tolist()) for x in target_dataset]
+        else:
+            names_sample = list(set(df_test.noun_id.values.tolist() + self.names))
+            length_set = len(names_sample)
+
+        data_module_kwargs = {
+            "config": self.config,
+            "results_path": self.model_path,
+            "num_train_epochs": self.config["CONFIGURATION"]["epochs"],
+            "train_batch_size": self.config["MODEL"]["batch_size"],
+            "val_batch_size": self.config["MODEL"]["batch_size"],
+            "num_reader_epochs": 1,
+        }
+        dataset = DataModule(**data_module_kwargs)
+        dataset.setup()
+
+        self.encoder = dataset.encoder
+        self.nb_features = dataset.nb_features
+
+        # Fields to be loaded from the dataset
+        all_fields = [
+            dataset.featureName,
+            dataset.targetName,
+            "noun_id",
+            "signal_names",
+        ]
+
+        target_encoded_all = []
+        list_signal_names = []
+        list_sample_names = []
+        with dataset.custom_dataloader(list_names=names_sample) as reader_filtered:
+            for idx, sample in enumerate(reader_filtered):
+                if idx == 0:
+                    np_signal = np.zeros(
+                        [length_set, sample.signal.shape[0], sample.signal.shape[1]]
+                    )
+                np_signal[idx, :, :] = sample.signal.astype(np.float32)
+                list_sample_names.append(np.array(sample.noun_id).astype(str).tolist())
+                target_encoded_all.append(getattr(sample, dataset.targetName))
+                list_signal_names.append(
+                    np.array(sample.signal_names).astype(str).tolist()
                 )
-            target_dataset = np.array(["0" if x == "" else x for x in target_dataset])
-            encoder.fit(target_dataset.reshape(-1, 1))
-        elif ml_data.config["MANIPULATION"]["target_encoding"] == "label_encoding":
-            classes = np.array(classes).astype(int).tolist()
-            encoder = preprocessing.MultiLabelBinarizer(classes=classes)
-            encoder.fit(target_dataset)
-        else:
-            raise ValueError("Encoder not supported in postprocessing")
-    return encoder
-
-
-def _plot_signal(
-    signal,
-    modified_signal,
-    randomly_modified_signal,
-    interp,
-    path_save,
-    signal_names,
-    name_sample,
-):
-    """
-    Plot the signal and the modified signal along the relevance
-    Parameters
-    ----------
-    signal: pd.DataFrame
-        signal to plot
-    modified_signal: pd.DataFrame
-        modified signal to plot
-    randomly_modified_signal: pd.DataFrame
-        randomly modified signal to plot
-    interp np.array:
-        interpolation method
-    path_save: str
-        path to save the figures
-    signal_names: list
-        names of the signals
-    name_sample: str
-        name of the sample
-    """
-
-    # plots
-    # ------------------------------------------------------
-    color_s = "black"
-    color_l = "tab:blue"
-    fig = plt.figure(figsize=(12, 1.5 * signal.shape[1]))
-    # height_ratios = [0.33, 0.33, 0.33]
-    gridspec = GridSpec(
-        ncols=1,
-        nrows=signal.shape[1],
-        figure=fig,
-        # height_ratios=height_ratios
-    )
-    for idx in range(signal.shape[1]):
-        if idx == 0:
-            ax0 = plt.subplot(gridspec[idx])
-            plt.plot(signal.loc[:, idx], color=color_s)
-            plt.plot(
-                modified_signal.loc[:, idx],
-                color="red",
-                label="Modified signal",
-            )
-            plt.plot(
-                randomly_modified_signal.loc[:, idx],
-                color="green",
-                label="Randomly modified signal",
-            )
-            plt.legend(bbox_to_anchor=(1.1, 1.0), loc="upper left")
-            plt.ylabel("Signal [" + signal_names[idx] + "]", color=color_s)
-            plt.tick_params(axis="y", labelcolor=color_s)
-            ax_t = ax0.twinx()
-            ax_t.plot(interp[:, idx], color=color_l)
-            ax_t.tick_params(axis="y", labelcolor=color_l)
-            ax_t.set_ylabel("Relevance", color=color_l)
-            plt.setp(ax0.get_xticklabels(), visible=False)
-        else:
-            ax = plt.subplot(gridspec[idx], sharex=ax0)
-            plt.plot(signal.loc[:, idx], color=color_s)
-            plt.plot(
-                modified_signal.loc[:, idx],
-                color="red",
-                label="Modified signal",
-            )
-            plt.plot(
-                randomly_modified_signal.loc[:, idx],
-                color="green",
-                label="Randomly modified signal",
-            )
-            plt.ylabel("Signal [" + signal_names[idx] + "]", color=color_s)
-            if idx == signal.shape[1] - 1:
-                plt.xlabel("Time")
-            plt.tick_params(axis="y", labelcolor=color_s)
-            ax_t = ax.twinx()
-            ax_t.plot(interp[:, idx], color=color_l)
-            ax_t.tick_params(axis="y", labelcolor=color_l)
-            ax_t.set_ylabel("LRP", color=color_l)
-            # make these tick labels invisible
-            if idx != signal.shape[1] - 1:
-                plt.setp(ax.get_xticklabels(), visible=False)
-
-    fig_path = os.path.join(path_save, "figures")
-    if not os.path.exists(fig_path):
-        os.makedirs(fig_path)
-    plt.tight_layout()
-    plt.savefig(os.path.join(fig_path, str(name_sample) + ".png"), dpi=200)
-    plt.close()
-
-
-def new_seriesZero(x, y):
-    """Function to include zero intercept in serie. This is required to correctly
-    separate the positive and negative area which are required to compute the
-    various interpretability metrics
-
-    Args:
-        x ([type]): [description]
-        y ([type]): [description]
-
-    Returns:
-        [type]: [description]
-    """
-    zero_crossings = np.where(np.diff(np.sign(y) >= 0))[0]
-    x_new = x.copy()
-    y_new = y.copy()
-
-    list_intercept = []
-    for val in zero_crossings:
-        x0 = x[val]
-        x1 = x[val + 1]
-
-        y0 = y[val]
-        y1 = y[val + 1]
-
-        a = (y1 - y0) / (x1 - x0)
-        b = y0 - a * x0
-        intercept = -b / a
-        list_intercept.append(intercept)
-
-    y_new = np.insert(y_new, zero_crossings + 1, [0] * len(zero_crossings))
-    x_new = np.insert(x_new, zero_crossings + 1, list_intercept)
-
-    return x_new, y_new
-
-
-def compute_area(x: np.array, y: np.array):
-    """Compute positive and negaitve arrea using trapezium rule
-
-    Args:
-        x (np.array): [description]
-        y (np.array): [description]
-
-    Returns:
-        np.array: [description]
-    """
-
-    y_right = y[1:]  # right endpoints
-    y_left = y[:-1]  # left endpoints
-    area = (y_right + y_left) / 2 * np.diff(x)
-
-    area_pos = np.sum(area[area > 0])
-    area_neg = np.sum(area[area < 0])
-
-    return area_neg, area_pos
+        # make sure that we remove the lines with zeros created initially in the array
+        if np_signal.shape[0] != len(list_sample_names):
+            raise ValueError("Mismatch in sample shapes")
+        np_signal = np_signal[: len(list_sample_names)]
+        name_not_in_list = [x for x in self.names if x not in list_sample_names]
+        if len(name_not_in_list) != 0:
+            print(f"{name_not_in_list} in name array are not included in the test set")
+            self.names = list(set(self.names) - set(name_not_in_list))
+        index_to_explain = np.where(np.isin(np.array(list_sample_names), self.names))
+        self.np_signal = np_signal[index_to_explain]
+        if self.np_signal.shape[0] != len(self.names):
+            raise ValueError("Missing samples in signal to analyse")
+        # Compute pred on self.np_signal
+        batch_size = 32
+        batched_sample = np.array_split(
+            self.np_signal, np.ceil(self.np_signal.shape[0] / batch_size)
+        )
+        score_pred = torch.tensor([], device=device, requires_grad=False)
+        for sample_signal in batched_sample:
+            with torch.no_grad():
+                score_pred = torch.cat(
+                    (
+                        score_pred,
+                        self.model(
+                            torch.Tensor(sample_signal.astype(np.float32)).to(device)
+                        ),
+                    ),
+                    0,
+                )
+        # get clean signals
+        self.baseline = np_signal.copy()
+        self.target_encoded = np.array(target_encoded_all)[
+            index_to_explain
+        ]  # encoded target
+        pred_idx = torch.zeros_like(score_pred)
+        idx_max = torch.argmax(score_pred, dim=1)
+        pred_idx[torch.arange(score_pred.shape[0]), idx_max] = 1  # predicted index
+        self.score_pred = score_pred.detach().cpu().numpy()  # predicted score
+        self.pred_idx = pred_idx.detach().cpu().numpy()  # predicted index
+        self.list_sample_names = np.array(list_sample_names)[index_to_explain].tolist()
+        self.list_signal_names = np.array(list_signal_names)[index_to_explain].tolist()
 
 
 def compute_summary_metrics(results_all: dict):
@@ -1420,45 +1188,64 @@ def compute_summary_metrics(results_all: dict):
         (pd.DataFrame): [description]
     """
 
-    name_col = ["score_drop_area", "pos_area", "neg_area", "expert_score"]
-    df_metrics = pd.DataFrame(index=results_all.keys(), columns=name_col)
-    for method in results_all.keys():
-        df_tmp = results_all[method].sort_index(ascending=False)
+    name_col = ["AUCSE_top", "F_score"]
+    keys_dict = list(results_all.keys())
+    methods = list(set([x.split("__")[0] for x in keys_dict]))
+    df_metrics = pd.DataFrame(index=methods, columns=name_col)
+    for method in methods:
+        df_tmp_top = results_all[f"{method}__top"].sort_index(ascending=True)
+        df_tmp_bottom = results_all[f"{method}__bottom"].sort_index(ascending=True)
+        tsup = df_tmp_top["mean_tic"]
+        metric_score_top = df_tmp_top["metric_score"]
+        metric_score_bottom = df_tmp_bottom["metric_score"]
+        # x = pd.concat([pd.Series(0), tsup]).reset_index(drop=True)
+        y = pd.concat([pd.Series(0), metric_score_top]).reset_index(drop=True)
 
-        tsup = df_tmp["mean_tic"]
-        metric_score = df_tmp["metric_score"]
-        x = pd.concat([pd.Series(0), tsup]).reset_index(drop=True)
-        y = pd.concat([pd.Series(0), metric_score]).reset_index(drop=True)
-        diff = np.diff(y.to_numpy())
-        diff_x = np.diff(x.to_numpy())
+        y_integration_aucse = metric_score_top
+        y_integration_aucse = np.append(0, y_integration_aucse)
+        y_integration_aucse = np.append(y_integration_aucse, y.iloc[-1])
+        x_integration_aucse = df_tmp_top.loc[:, "mean_ratio_pts_removed"]
+        x_integration_aucse = np.append(0, x_integration_aucse)
+        x_integration_aucse = np.append(x_integration_aucse, 1)
 
-        measure_y = (diff / diff_x) - 1
-        x_new = x[1:].to_numpy()
-        x_zero, y_zero = new_seriesZero(x_new, measure_y)
-
-        neg_area, pos_area = compute_area(x_zero, y_zero)
-        df_metrics.loc[method, "pos_area"] = pos_area
-        df_metrics.loc[method, "neg_area"] = neg_area
-        y_integration = metric_score
-        y_integration = np.append(0, y_integration)
-        y_integration = np.append(y_integration, y.iloc[-1])
-        x_integration = df_tmp.loc[:, "mean_ratio_pts_removed"]
-        x_integration = np.append(0, x_integration)
-        x_integration = np.append(x_integration, 1)
-        df_metrics.loc[method, "score_drop_area"] = integrate.simpson(
-            y=y_integration, x=x_integration
+        idx_small = np.argwhere(np.diff(x_integration_aucse) < 10**-2)
+        if len(idx_small) > 0:
+            print(f"deleting points for {method}")
+            # drop points as create instability in integration method
+            x_integration_aucse = np.delete(x_integration_aucse, idx_small)
+            y_integration_aucse = np.delete(y_integration_aucse, idx_small)
+        df_metrics.loc[method, "AUCSE_top"] = integrate.simpson(
+            y=y_integration_aucse, x=x_integration_aucse
         )
 
-        if method == "saliency":
-            y_integration = df_tmp.loc[:, "metric_score_random"].copy()
+        y_integration_top = metric_score_top
+        y_integration_top = np.append(0, y_integration_top)
+        x_integration_top = df_tmp_top.loc[:, "mean_ratio_pts_removed"]
+        x_integration_top = np.append(0, x_integration_top)
+        integral_top = integrate.simpson(y=y_integration_top, x=x_integration_top)
+
+        y_integration_bottom = metric_score_bottom
+        y_integration_bottom = np.append(0, y_integration_bottom)
+        x_integration_bottom = df_tmp_bottom.loc[:, "mean_ratio_pts_removed"]
+        x_integration_bottom = np.append(0, x_integration_bottom)
+        integral_bottom = integrate.simpson(
+            y=y_integration_bottom, x=x_integration_bottom
+        )
+
+        F_score = (integral_top * (1 - integral_bottom)) / (
+            integral_top + (1 - integral_bottom)
+        )
+        df_metrics.loc[method, "F_score"] = F_score
+
+        if method == "integrated_gradients":
+            y_integration = df_tmp_top.loc[:, "metric_score_random"].copy()
             y_integration = np.append(0, y_integration)
             y_integration = np.append(y_integration, y.iloc[-1])
-            x_integration = df_tmp.loc[:, "mean_ratio_pts_removed"]
+            x_integration = df_tmp_top.loc[:, "mean_ratio_pts_removed"]
             x_integration = np.append(0, x_integration)
             x_integration = np.append(x_integration, 1)
-            df_metrics.loc["random", "score_drop_area"] = integrate.simpson(
+            df_metrics.loc["random", "AUCSE_top"] = integrate.simpson(
                 y=y_integration, x=x_integration
             )
 
-        df_metrics.loc[method, "expert_score"] = df_tmp.loc[:, "expert_score"].iloc[0]
     return df_metrics

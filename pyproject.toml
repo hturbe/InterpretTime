@@ -1,0 +1,28 @@
+[tool.pdm]
+
+[project]
+name = ""
+version = ""
+description = ""
+authors = [
+    {name = "hturbe", email = "hugues.turbe@gmail.com"},
+]
+dependencies = [
+    "more-itertools==8.13.0",
+    "numpy==1.21.4",
+    "pandas==1.3.4",
+    "petastorm==0.11.3",
+    "pytorch-lightning==1.5.3",
+    "ray",
+    "scikit-learn==1.0.1",
+    "seaborn==0.11.2",
+    "torch==1.11.0",
+    "xarray==2022.6.0",
+    "matplotlib==3.5.0",
+    "ipykernel>=6.20.1",
+    "pyspark==3.2.0",
+    "captum>=0.6.0",
+    "openpyxl>=3.0.10",
+]
+requires-python = "==3.8.16"
+license = {text = "MIT"}

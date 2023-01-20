@@ -7,71 +7,86 @@
 import argparse
 import os
 import re
-import shutil
 import sys
-import time
 
 import numpy as np
-import pandas as pd
 
-CWD = os.getcwd()
 FILEPATH = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(os.path.join(FILEPATH, "../"))
-from learning_pytorch.Trainable import Trainable
 from postprocessing_pytorch.manipulation_results import ScoreComputation
+from shared_utils.utils_path import trained_model_path
+from shared_utils.utils_visualization import plot_DeltaS_results, plot_additional_results
 
 # parse command-line parameters
 parser = argparse.ArgumentParser(description="Process files.")
 parser.add_argument(
-    "--results_path",
+    "--model_path",
     type=str,
     help="Path to the folder with the model and its results",
-    default="../../trained_models/dynamics/SD1_CNN",
+    default=f"{trained_model_path}/forda_cnn_normal",
+)
+parser.add_argument(
+    "--sample_file",
+    help="Name of numpy array with sample. Look into assets/samples_path",
+    # default=None,
+    default="sample_forda.npy",
 )
 parser.add_argument(
     "--method_relevance",
     help="List with the relevance method to use for interpretability results",
-    default = ['shapleyvalue','integrated_gradients', 'deeplift', 'gradshap','saliency', 'kernelshap'],
+    default=[
+        "integrated_gradients",
+        "deeplift",
+        "deepliftshap",
+        "gradshap",
+        "shapleyvalue",
+        "kernelshap",
+    ],
     nargs="+",
 )
 
 args = parser.parse_args()
-results_path = args.results_path
-results_path = os.path.abspath(results_path)
+model_path = args.model_path
+model_path = os.path.abspath(model_path)
 method_relevance = args.method_relevance
-
+path_asset = os.path.join(FILEPATH, "..", "assets", "samples_post")
+if args.sample_file is not None:
+    names_sample = np.load(os.path.join(path_asset, args.sample_file)).tolist()
+else:
+    names_sample = None
 # interpretability
 plot_signal = 0  # plot every x signal or False & 0 to plot no signal
-replacement_methods = ["normal", "permutation"]
-
 res = [
     f
-    for f in os.listdir(results_path)
+    for f in os.listdir(model_path)
     if re.search(r"config[a-zA-Z0-9_]+(.yaml|.xml)", f)
 ]
-fc = os.path.abspath(os.path.join(results_path, res[0]))
+fc = os.path.abspath(os.path.join(model_path, res[0]))
 
-names = None
-# names = ['lorenz__245', 'duffing__435', 'duffing__456']
-all_quantile = np.arange(0.05, 1.05, 0.10)
+all_qfeatures = np.arange(0.05, 1.05, 0.10)
+all_qfeatures = np.round(all_qfeatures, 2).tolist()
+all_qfeatures.append(1.0)
 
-# Initiate instance of ScoreComputation class
+all_qfeatures = [0.05, 0.15,1.0]
+
 manipulation_results = ScoreComputation(
-    results_path=results_path, names=names, plot_signal=plot_signal
+    model_path=model_path,
+    names=names_sample,
+    model_output="probabilities",
+    # model_output ="logits",
+    plot_signal=plot_signal,
 )
 
-# compute relevances using prescribed methods
 for method in method_relevance:
     df_rel = manipulation_results.compute_relevance(method)
 
-# Iterate over replacement methods
-for replace_method in replacement_methods:
+for method in method_relevance:
+    _ = manipulation_results.compute_scores_wrapper(
+        all_qfeatures, method
+    )
+    manipulation_results.create_summary(method)
+manipulation_results.summarise_results()
 
-    # Iterate over interpretability methods
-    for method in method_relevance:
-        _ = manipulation_results.compute_scores_wrapper(
-            all_quantile, method, replace_method
-        )
-        manipulation_results.create_summary(method, replace_method)
-    save_results = os.path.join(results_path, "interpretability_results")
-    manipulation_results.plot_summary_results(save_results, replace_method)
+save_results_path = manipulation_results.save_results
+plot_DeltaS_results(save_results_path)
+plot_additional_results(save_results_path)

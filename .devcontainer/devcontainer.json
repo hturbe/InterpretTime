@@ -1,0 +1,39 @@
+{
+    "name": "Python 3",
+    "build": {
+        "dockerfile": "Dockerfile",
+        "context": "..",
+        "args": {
+            "VARIANT": "3.8",
+            "NODE_VERSION": "none"
+        }
+    },
+    "hostRequirements": {
+        "gpu": true
+    },
+    "features": {
+        "ghcr.io/devcontainers/features/nvidia-cuda:1": {}
+    },
+    "runArgs": [
+        "--gpus",
+        "all"
+    ],
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-python.python",
+                "bungcip.better-toml",
+                "njqdev.vscode-python-typehint",
+                "spmeesseman.vscode-taskexplorer",
+                "matangover.mypy",
+                "knowsuchagency.pdm-task-provider",
+                "ms-python.black-formatter",
+                "ms-toolsai.jupyter",
+                "github.copilot",
+                "mrmlnc.vscode-duplicate"
+            ]
+        }
+    },
+    "postCreateCommand": "./.devcontainer/postCreateCommand.sh",
+    "remoteUser": "vscode"
+}

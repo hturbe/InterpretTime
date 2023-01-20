@@ -1,13 +1,22 @@
-# InterpretTime: a new approach for the systematic evaluation of neural-network interpretability in time series classification
+<div align="center">
+
+# Evaluation of post-hoc interpretability methods in time-series classification
+<a href="https://arxiv.org/abs/2202.05656"><img alt="Paper" src="https://img.shields.io/badge/paper-arxiv.2202.05656-B31B1B.svg"></a>
+<a href="https://pdm.fming.de"><img alt="pdm" src="https://img.shields.io/badge/pdm-managed-blueviolet"></a>
+<a href="https://github.com/hturbe/InterpretTime/blob/main/LICENSE"><img alt="Paper" src="https://img.shields.io/badge/License-MIT-green.svg?labelColor=gray)"></a>
+<!-- <a href="https://zenodo.org/badge/454440652.svg"><img alt="DOI" src="https://zenodo.org/badge/latestdoi/454440652"></a> -->
+
+
+</div>
 
 This repository is the implementation code for :
-[InterpretTime: a new approach for the systematic evaluation of neural-network interpretability in time series classification](http://arxiv.org/abs/2202.05656).
+[Evaluation of post-hoc interpretability methods in time-series classification](http://arxiv.org/abs/2202.05656).
 
 If you find this code or idea useful, please consider citing our work:
 
 ```
 @misc{turbé2022interprettime,
-      title={InterpretTime: a new approach for the systematic evaluation of neural-network interpretability in time series classification}, 
+      title={Evaluation of post-hoc interpretability methods in time-series classification},
       author={Hugues Turbé and Mina Bjelogrlic and Christian Lovis and Gianmarco Mengaldo},
       year={2022},
       eprint={2202.05656},
@@ -16,134 +25,140 @@ If you find this code or idea useful, please consider citing our work:
 
 #### Table of Contents
 * [Overview](#overview)
-  + [Family of synthetic datasets](#family-of-synthetic-datasets)
-    - [CNN](#cnn)
-    - [Bi-LSTM](#bi-lstm)
-    - [Transformer](#transformer)
-  + [ECG dataset](#ecg-dataset)
+* [Data](#data)
+  + [Datasets](#datasets)
+  + [Trained Models](#trained-models)
+  + [Paper's results](#papers-results)
 * [Usage](#usage)
   + [Requirements](#requirements)
   + [Setup](#setup)
-  + [Pre-trained Models](#pre-trained-models)
+  + [Synthetic dataset creation](#synthetic-dataset-creation)
   + [Post-processing](#post-processing)
-* [Example for Dynamical system dataset](#example-for-dynamical-system-dataset)
+* [Example for synthetic dataset](#example-for-synthetic-dataset)
 * [Example for ECG dataset](#example-for-ecg-dataset)
-  
+
 ## Overview
 
-This repository presents the framework used in the paper "InterpretTime: a new approach for the systematic evaluation of neural-network interpretability in time series classification". The framework allows 
-- evaluating and ranking of interpretability methods' performance via the AUCSE metric; 
-- assessing the overlap between a human expert and a neural network in terms of data interpretation, 
-for time series classification. 
+This repository presents the framework used in the paper "Evaluation of post-hoc interpretability methods in time-series classification". The framework allows evaluating and ranking of interpretability methods' performance via the AUCSE metric;
+for time series classification. As depicted in Fig.1, different interpretability methods can produce tangibly different results for the same model. It therefore becomes key to understand which intepretability method better reflect what the model learned and how the latter is using the input features. The paper also introduces a new synthetic dataset with tunable complexity that can be used to assess the performance of interpretability methods, and that is able to reproduce time-series classification tasks of arbitrary complexity.
 
-The paper also introduces a new family of synthetic datasets with tunable complexity that can be used to assess the performance of interpretability methods, and that is able to reproduce time-series classification tasks of arbitrary complexity. 
+<p align="center"><img  src="docs/figures/fig_article.png"></p>
 
-In the tables below we show the ranking of 6 common interpretabilty methods using the AUCSE metric for 3 different neural-network architectures and for both the family of synthetic datasets, and for an ECG dataset.
+**Fig.1**: Relevance produced by four post-hoc interpretability methods, obtained on a time-series classification task, where a Transformer neural network needs to identify the pathology of a patient from ECG data. Depicted in black are two signals, V1, and V2, while the contour map represents the relevance produced by the interpretability method. Red indicates positive relevance, while blue indicate negative relevance. The former marks portions of the time series that were deemed important by the interpretability method for the neural-network prediction. The latter marks portions of the time series that were going against the prediction.
 
 
-### Family of synthetic datasets
 
-#### CNN
+## Data
+Data associated with this repository as well as results presented in the article can be found on [Zenodo](https://zenodo.org/record/7534770#.Y8lkkXbMI2w) and are organised in 3 zip files. The folders should be unzipped and copied into `data/`.
 
-| Method               | SD1        | SD2       | SD3        | Average   | Ranking |
-|----------------------|------------|-----------|------------|-----------|---------|
-| DeepLift             | 0.877      | 0.904     | 0.878      | 0.886     | 2       |
-| GradShap             | 0.816      | 0.836     | 0.835      | 0.829     | 4       |
-| Integrated Gradients | 0.877      | 0.904     | **0.879**  | 0.886     | 2       |
-| KernelShap           | 0.629      | 0.61      | 0.652      | 0.63      | 6       |
-| Saliency             | 0.799      | 0.755     | 0.806      | 0.787     | 5       |
-| **Shapley Sampling** | **0.883**  | **0.907** | 0.873      | **0.888** | **1**   |
-| Random               | 0.606      | 0.578     | 0.634      | 0.606     | 7       |
-
-
-#### Bi-LSTM
-
-| Method               | SD1        | SD2       | SD3       | Average   | Ranking |
-|----------------------|------------|-----------|-----------|-----------|---------|
-| DeepLift             | 0.512      | 0.566     | 0.607     | 0.562     | 5       |
-| GradShap             | 0.587      | 0.557     | 0.598     | 0.581     | 4       |
-| Integrated Gradients | 0.658      | 0.738     | 0.725     | 0.707     | 2       |
-| KernelShap           | 0.437      | 0.364     | 0.408     | 0.403     | 6       |
-| Saliency             | 0.651      | 0.539     | 0.583     | 0.591     | 3       |
-| **Shapley Sampling** | **0.704**  | **0.825** | **0.749** | **0.759** | **1**   |
-| Random               | 0.415      | 0.388     | 0.381     | 0.394     | 7       |
-
-#### Transformer
-
-| Method                   | SD1        | SD2       | SD3       | Average   | Ranking |
-|--------------------------|-------     |-------    |-------    |---------  |---------|
-| DeepLift                 | 0.827      | 0.847     | 0.774     | 0.816     | 4       |
-| GradShap                 | 0.867      | 0.858     | 0.78      | 0.835     | 3       |
-| **Integrated Gradients** | **0.916**  | **0.916** | 0.816     | **0.883** | **1**   |
-| KernelShap               | 0.43       | 0.406     | 0.470     | 0.435     | 6       |
-| Saliency                 | 0.463      | 0.526     | 0.417     | 0.469     | 5       |
-| Shapley Sampling         | 0.898      | 0.909     | **0.830** | 0.879     | 2       |
-| Random                   | 0.295      | 0.314     | 0.293     | 0.301     | 7       |
-
-### ECG dataset
-
-The result for the classification task on the ECG dataset with the AUCSE metric are presented in the table below.
-
-|                          | CNN        | Bi-LSTM       | Transformer |
-|--------------------------|------------|---------------|-------------|
-| DeepLift                 | 0.47       | 0.603         | 0.63        |
-| GradShap                 | 0.456      | 0.561         | 0.714       |
-| Integrated Gradients     | 0.477      | 0.649         | 0.759       |
-| KernelShap               | 0.336      | 0.173         | 0.444       |
-| Saliency                 | 0.388      | 0.332         | 0.659       |
-| **Shapley Sampling**     | **0.484**  | **0.652**     | **0.802**   |
-
-## Usage
-
-### Requirements
-
-Setup tested with python 3.7.0 and Linux
-
-To install requirements:
- 
-```setup
-pip install -r requirements.txt
+```
+data
+├── datasets
+├── trained_models
+└── results_paper
 ```
 
-### Setup
+### Datasets
+Three datasets were used in the article:
+- **ecg**: Processed version of the CPSC dataset from [Classification of 12-lead ECGs: the PhysioNet - Computing in Cardiology Challenge 2020](https://physionet.org/content/challenge-2020/1.0.2/)
 
-Data are stored in the zip file called `datasets.zip` and should be unzip to obtain the following structure:
+- **fordA**: Dataset from the [UCR Time Series Classification Archive](https://cs.ucr.edu/~eamonn/time_series_data_2018/)
+
+- **synthetic**: Synthetic dataset specifically developed for the purpose of the article
+
+Each dataset is provided in Parquet format compatible with [Petastorm](https://github.com/uber/petastorm#petastorm) with each folder organised as follows:
+
 ```
-ts_robust_interpretability
-    │
-    ├── src
-    ├──trained_model
-    |  ├── dynamics 
-    |  └── ecg
-    │ 
-    └──datasets
-       ├── dynamics 
-       └── ecg
+Datasets
+    ├── dataParquet
+    ├── config__***.json
+    ├── train.npy
+    ├── val.npy
+    └── test.npy
 ```
+-  `dataParquet`: folder with the data formatted with Petastorm
 
-  
-### Pre-trained Models
+-  `config__***.json`: configuration file used to process the data
 
-Pre-trained models are provided in the *trained_model* folder. There are 9 models related to the synthetic dataset family (dynamics) and 3 models related to the ECG dataset.
-Each folder with a model is organised as follows:
+-  `train.npy`: numpy array with the names of the samples used for the training set
+
+-  `val.npy`: numpy array with the names of the samples used for the validation set
+
+-  `test.npy`: numpy array with the names of the samples used for the test set
+
+### Trained Models
+
+Trained models are provided in the `trained_models` folder. A transformer, bi-lstm and CNN model are trained for three different datasets respectively called: *ecg*, *fordA* and *synthetic*. Each folder contains the following files:
+
 ```
 Simulation
-    ├── results 
-    ├── classes_encoder.npy 
-    ├── config__***.yaml 
+    ├── results
+    ├── classes_encoder.npy
+    ├── config__***.yaml
+    ├── stats_scaler.csv
     └── best_model.ckpt
 ```
 
--  `results`: folder with the results of the simulation
+-  `results`: folder with the classification results of the simulation
 
 -  `classes_encoder.npy`: class used for the encoder
 
 -  `config__***.yaml`: config file with model's hyperparameters
 
--  `best_model.ckpt`: saved model 
+-  `stats_scaler.csv`: Mean and median of the samples included in the training set (use to normalise the data)
 
+-  `best_model.ckpt`: saved model
 
+### Paper's results
+The results obtained in the paper can be found in the `results_paper` folder. This folder includes the relevance obtained across the different models trained as well as the evaluation metrics. The results are organised as follows:
 
+```
+results_paper
+    ├── model_interpretability
+        └── simulation
+             ├── interpretability_raw
+             └── interpretability_results
+    └── summary_results
+```
+-  `interpretability_raw`: include the relevance computed using the different interpretability methods for each sample which was included in the analysis
+
+-  `interpretability_results`: include a summary of the different metrics for each interpretability metrics as well as a summary across the different methods included in `metrics_methods.csv`
+
+## Usage
+Setup tested with python 3.8.16 and Linux. Building the container described below and installing the python requirements can take up to 10 minutes the first time.
+
+### Devcontainer
+A configuration for a development container is provided in the `.devcontainer` folder. The current configuration assumes a CUDA-compatible gpu is available. In case gpus are not available, the following lines in `.devcontainer/devcontainer.json` should be commented
+```json
+    "hostRequirements": {
+        "gpu": true
+    },
+    "features": {
+        "ghcr.io/devcontainers/features/nvidia-cuda:1": {}
+    },
+    "runArgs": [
+        "--gpus",
+        "all"
+    ],
+```
+### Requirements
+
+The python packages are managed with PDM. If the project is not run using the .devcontainer provided, pdm should first be installed ([see instructions](https://pdm.fming.dev/latest/#installation)) before installing the packages with the following command:
+
+```bash
+pdm install
+```
+
+### Synthetic dataset creation
+The synthetic dataset presented in the article can be recreated using the script in `src/operations/__exec_generate_data.py`. The command takes as input a `.yaml` file to configure the parameters used to generate the dataset. An example can be found in `environment/config_generate_synthetic.yaml`.
+
+ e.g. from within src/operations:
+
+```generate_synthetic
+python3 __exec_generate_data.py --config_file ../../environment/config_generate_synthetic.yaml
+```
+
+A notebook to visualise the samples from the synthetic dataset is included in `/src/notebooks/visualise_sample.ipynb`.
 ### Post-processing
 
 Relevance and metrics presented in the paper can be computed using the following command from within the src/operations folder:
@@ -152,22 +167,28 @@ Relevance and metrics presented in the paper can be computed using the following
 python3 __exec_postprocessing.py --results_path --method_relevance
 ```
 
-
 -  `results_path`: path to the folder with the trained model
+
+-  `sample_file`: name of the file stored in `src/assets/sample_post`. This file contains the name of the samples on which the relevance as well as the metrics are computed on.
 
 -  `method_relevance`: list of interpretability method to be evaluated. Can be one (or a list) of [shapleyvalue, integrated_gradients, deeplift, gradshap, saliency, kernelshap]
 
-Interpretability evaluation metrics are saved in `results_path/interpretability_results`
+Interpretability evaluation metrics are saved in `results/name_simulation`
 
-## Example for Dynamical system dataset
-
+## Example for synthetic dataset
+From within src/operations:
 ```relevance
-python3 __exec_postprocessing.py --results_path ../../trained_models/dynamics/SD1_CNN
+python3 __exec_postprocessing.py --model_path ../../data/trained_models/synthetic_cnn --sample_file sample_synthetic.npy
 ```
 
-
 ## Example for ECG dataset
-
+From within src/operations:
 ```relevance
-python3 __exec_postprocessing.py --results_path ../../trained_models/ecg/CNN
+python3 __exec_postprocessing.py --model_path ../../data/trained_models/ecg_cnn --sample_file sample_ecg.npy
+```
+
+## Example for FordA dataset
+From within src/operations:
+```relevance
+python3 __exec_postprocessing.py --model_path ../../data/trained_models/forda_cnn --sample_file sample_forda.npy
 ```

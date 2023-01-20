@@ -12,12 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-Some loaded were rewritten to allow selecting specific fields of interest in the dataset
-"""
 import collections
 import decimal
-
 # Must import pyarrow before torch. See: https://github.com/uber/petastorm/blob/master/docs/troubleshoot.rst
 import re
 import logging
@@ -27,21 +23,11 @@ from torch.utils.data.dataloader import default_collate
 import torch
 from packaging import version
 
-from petastorm.reader_impl.shuffling_buffer import (
-    RandomShufflingBuffer,
-    NoopShufflingBuffer,
-)
-from petastorm.reader_impl.pytorch_shuffling_buffer import (
-    BatchedRandomShufflingBuffer,
-    BatchedNoopShufflingBuffer,
-)
-from petastorm.pytorch import (
-    _sanitize_pytorch_types,
-    decimal_friendly_collate,
-    LoaderBase,
-)
-
-_TORCH_BEFORE_1_1 = version.parse(torch.__version__) < version.parse("1.1.0")  # type: ignore
+from petastorm.reader_impl.shuffling_buffer import RandomShufflingBuffer, NoopShufflingBuffer
+from petastorm.reader_impl.pytorch_shuffling_buffer import BatchedRandomShufflingBuffer, \
+    BatchedNoopShufflingBuffer
+from petastorm.pytorch import _sanitize_pytorch_types,decimal_friendly_collate, LoaderBase
+_TORCH_BEFORE_1_1 = version.parse(torch.__version__) < version.parse('1.1.0')  # type: ignore
 
 if PY2:
     _string_classes = basestring  # noqa: F821
@@ -49,6 +35,8 @@ else:
     _string_classes = (str, bytes)
 
 logger = logging.getLogger(__name__)
+
+
 
 
 _PARALLEL_ITER_ERROR = "You must finish a full pass of Petastorm DataLoader before making another pass from the \
@@ -66,14 +54,8 @@ class DataLoader(LoaderBase):
     runs out of samples.
     """
 
-    def __init__(
-        self,
-        reader,
-        batch_size=1,
-        collate_fn=decimal_friendly_collate,
-        shuffling_queue_capacity=0,
-        desired_fields=None,
-    ):
+    def __init__(self, reader, batch_size=1, collate_fn=decimal_friendly_collate,
+                 shuffling_queue_capacity=0, desired_fields= None):
         """
         Initializes a data loader object, with a default collate.
 
@@ -120,11 +102,9 @@ class DataLoader(LoaderBase):
             # We can not know what is the reasonable number to use for the extra capacity, so we set a huge number
             # and give up on the unbound growth protection mechanism.
             min_after_dequeue = self.shuffling_queue_capacity - 1
-            self._shuffling_buffer = RandomShufflingBuffer(
-                self.shuffling_queue_capacity,
-                min_after_retrieve=min_after_dequeue,
-                extra_capacity=100000000,
-            )
+            self._shuffling_buffer = RandomShufflingBuffer(self.shuffling_queue_capacity,
+                                                           min_after_retrieve=min_after_dequeue,
+                                                           extra_capacity=100000000)
         else:
             self._shuffling_buffer = NoopShufflingBuffer()
 
@@ -135,9 +115,7 @@ class DataLoader(LoaderBase):
             row_as_dict = row._asdict()
             # We add the posibility to select given rows
             if self.desired_fields != None:
-                row_as_dict = collections.OrderedDict(
-                    subset(row_as_dict, self.desired_fields)
-                )
+                row_as_dict= collections.OrderedDict(subset(row_as_dict, self.desired_fields))
 
             keys = row_as_dict.keys()
             # Promote some types that are incompatible with pytorch to be pytorch friendly.
@@ -197,22 +175,16 @@ class DataLoader(LoaderBase):
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.reader.stop()
         self.reader.join()
-
-
+    
 class BatchedDataLoader(LoaderBase):
     """
     Same as DataLoader except it uses torch-based shuffling buffers which enable batched buffering
     (significantly faster for small data).
     """
 
-    def __init__(
-        self,
-        reader,
-        batch_size=1,
-        transform_fn=None,
-        shuffling_queue_capacity=0,
-        desired_fields=None,
-    ):
+    def __init__(self, reader, batch_size=1,
+                 transform_fn=None,
+                 shuffling_queue_capacity=0, desired_fields= None):
         """
         Initializes a data loader object.
         Number of epochs is defined by the configuration of the reader argument.
@@ -258,13 +230,12 @@ class BatchedDataLoader(LoaderBase):
                 shuffling_queue_capacity,
                 min_after_retrieve=min_after_dequeue,
                 extra_capacity=100000000,
-                batch_size=self.batch_size,
-            )
-        else:
-            self._shuffling_buffer = BatchedNoopShufflingBuffer(
                 batch_size=self.batch_size
             )
+        else:
+            self._shuffling_buffer = BatchedNoopShufflingBuffer(batch_size=self.batch_size)
 
+        
         subset = lambda d, keys: {key: d[key] for key in keys}
         for row in self.reader:
             # Default collate does not work nicely on namedtuples and treat them as lists
@@ -272,9 +243,7 @@ class BatchedDataLoader(LoaderBase):
             row_as_dict = row._asdict()
             # We add the posibility to select given rows
             if self.desired_fields != None:
-                row_as_dict = collections.OrderedDict(
-                    subset(row_as_dict, self.desired_fields)
-                )
+                row_as_dict= collections.OrderedDict(subset(row_as_dict, self.desired_fields))
 
             keys = row_as_dict.keys()
 

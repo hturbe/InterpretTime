@@ -3,14 +3,14 @@
 
 """
   BiLSTM  implementation in pytorch
-  Written by H.Turbé, May 2021.
 """
 import os
 import re
 import sys
-from types import SimpleNamespace
 
+import torch
 import torch.nn as nn
+from types import SimpleNamespace
 
 FILEPATH = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(os.path.join(FILEPATH))
@@ -33,7 +33,7 @@ class BiLstmModel(nn.Module):
         self.hparams = SimpleNamespace(
             num_classes=kwargs["n_classes"],
             filter_arrays=hparams["cell_array"],
-            dropout=hparams["dropout"],
+            dropout=hparams.get("dropout", 0.0),
             act_fn_name=hparams["act_fn_name"],
             act_fn=hparams["act_fn"],
         )
@@ -41,7 +41,7 @@ class BiLstmModel(nn.Module):
         self._create_network()
 
     def _create_network(self):
-
+        self.activation = nn.ReLU
         blocks = []
         dropout = self.hparams.dropout
         for idx, filters in enumerate(self.hparams.filter_arrays):
@@ -54,7 +54,7 @@ class BiLstmModel(nn.Module):
                             hidden_size=filters,
                             bidirectional=True,
                             batch_first=True,
-                        )
+                        )  #
                     )
                 )
             elif idx == len(self.hparams.filter_arrays) - 1:
@@ -62,13 +62,13 @@ class BiLstmModel(nn.Module):
                 blocks.append(
                     nn.Sequential(
                         LSTM_wraper(
-                            input_size=self.hparams.filter_arrays[idx - 1] * 2,
+                            input_size=self.hparams.filter_arrays[idx - 1],
                             dropout=dropout,
                             hidden_size=filters,
                             bidirectional=True,
                             batch_first=True,
                             return_last=True,
-                        )
+                        ),
                     )
                 )
             else:
@@ -76,12 +76,12 @@ class BiLstmModel(nn.Module):
                 blocks.append(
                     nn.Sequential(
                         LSTM_wraper(
-                            input_size=self.hparams.filter_arrays[idx - 1] * 2,
+                            input_size=self.hparams.filter_arrays[idx - 1],
                             dropout=dropout,
                             hidden_size=filters,
                             bidirectional=True,
                             batch_first=True,
-                        )
+                        ),
                     )
                 )
 
@@ -94,7 +94,10 @@ class BiLstmModel(nn.Module):
         )
 
     def forward(self, inputs):
-        x = self.blocks(inputs)
+        # inputs = self.conv1(inputs)
+        # inputs = self.conv2(inputs)
+        x = inputs.permute(0, 2, 1)  # [batch_size, seq_len, n_features]
+        x = self.blocks(x)
         output = self.output_net(x)
         return output
 
@@ -135,6 +138,7 @@ class LSTM_wraper(nn.Module):
         self.return_last = return_last
 
         self._create_network()
+        self.apply(self._init_weights)
 
     def _create_network(self):
         self.lstm = nn.LSTM(
@@ -143,11 +147,28 @@ class LSTM_wraper(nn.Module):
             bidirectional=self.bidirectional,
             batch_first=self.batch_first,
         )
+        self.linear = nn.Linear(self.hidden_size * 2, self.hidden_size)
+        self.activation = nn.ReLU()
+        self.norm = nn.BatchNorm1d(self.hidden_size, eps=1e-5)
+
+    def _init_weights(self, m):
+        if isinstance(m, (nn.LSTM, nn.Linear)):
+            for name, param in m.named_parameters():
+                if "bias" in name:
+                    nn.init.constant(param, 0.0)
+                elif "weight" in name:
+                    nn.init.xavier_normal(param)
 
     def forward(self, inputs):
         h, (h_T, c_T) = self.lstm(inputs)
-
         if self.return_last:
-            return self.dropout(h[:, -1, :])
+            x = self.dropout(h[:, -1, :])
         else:
-            return self.dropout(h)
+            x = self.dropout(h)
+            x = self.linear(x)
+            x = self.activation(x)
+            x = x.permute(0, 2, 1)  # (batch_size, d_model, seq_len)
+            x = self.norm(x)
+            x = x.permute(0, 2, 1)  # (batch_size, seq_len, d_model)
+
+        return x

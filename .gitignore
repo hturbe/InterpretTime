@@ -130,6 +130,11 @@ dmypy.json
 
 .vscode/
 
+data/
+src/notebooks/*
+!src/notebooks/visualise_sample.ipynb
 
-datasets/
-**/interpretability_results/*
+results/
+results_paper/
+ignoreme.*
+figures_paper

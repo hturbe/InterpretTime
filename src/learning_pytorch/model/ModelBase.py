@@ -1,10 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-    Model constructor with common routines
-    Written by H.Turbé, May 2021.
-"""
 import os
 import sys
 
@@ -17,18 +10,9 @@ from torchmetrics import Accuracy, MetricCollection, Precision, Recall
 
 FILEPATH = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(os.path.join(FILEPATH))
-
-
-from BiLstmModel import BiLstmModel
-from CnnModel import CnnModel
-from TransformerModel import TransformerModel
-
-model_dict = {
-    "cnn": CnnModel,
-    "bilstm": BiLstmModel,
-    "transformer": TransformerModel,
-}
-
+sys.path.append(os.path.dirname(FILEPATH))
+from model import model_registry
+import transform.augment_signal as T
 act_fn_by_name = {
     "tanh": nn.Tanh,
     "relu": nn.ReLU,
@@ -36,22 +20,23 @@ act_fn_by_name = {
     "gelu": nn.GELU,
 }
 
+def unwrap_metrics(output):
+    """
+    Unwrap metrics from pytorch lightning metrics when they are not averaged in order
+    to log them in tensorboard
 
-class CosineWarmupScheduler(optim.lr_scheduler._LRScheduler):
-    def __init__(self, optimizer, warmup, max_iters):
-        self.warmup = warmup
-        self.max_num_iters = max_iters
-        super().__init__(optimizer)
+    Input:
+        output: dict of metrics
+    Output:
+        output: dict of flattened metrics
+    """
+    to_be_flattened = [x for x in output.items() if x[1].ndim > 0]
+    for el in to_be_flattened:
+        new_el = {f"{el[0]}_{idx}": el[1][idx] for idx in range(el[1].shape[0])}
+        output.update(new_el)
+        del output[el[0]]
 
-    def get_lr(self):
-        lr_factor = self.get_lr_factor(epoch=self.last_epoch)
-        return [base_lr * lr_factor for base_lr in self.base_lrs]
-
-    def get_lr_factor(self, epoch):
-        lr_factor = 0.5 * (1 + np.cos(np.pi * epoch / self.max_num_iters))
-        if epoch <= self.warmup:
-            lr_factor *= epoch * 1.0 / self.warmup
-        return lr_factor
+    return output
 
 
 class ModelBase(pl.LightningModule):
@@ -80,20 +65,41 @@ class ModelBase(pl.LightningModule):
         self.model = create_model(model_hparams, **kwargs)
         self.signal_name = signal_name
         self.target_name = target_name
-
+        if model_hparams.get("augmenter_mag", None) not in [None,0]:
+            str_ops = model_hparams.get("augmenter_ops",None) if model_hparams.get("augmenter_ops",None) is not None else "all operations"
+            self.augmenter = T.RandAugment(magnitude = model_hparams["augmenter_mag"], augmentation_operations = model_hparams.get("augmenter_ops",None))
+        else:
+            self.augmenter = None
         # Create loss module
 
         if kwargs["loss_type"] == "binary_crossentropy":
-            print("Loss type", "binary_crossentropy")
             self.loss_module = nn.BCEWithLogitsLoss()
         elif kwargs["loss_type"] == "categorical_crossentropy":
-            self.loss_module = nn.CrossEntropyLoss()
+            self.loss_module = nn.CrossEntropyLoss(label_smoothing =model_hparams.get("label_smoothing", 0.0))
         else:
             raise ValueError("Loss type not supported")
 
-        # Create metrics
-        metrics = MetricCollection([Accuracy(), Precision(), Recall()])
-        self.train_metrics = metrics.clone(prefix="train_")
+        # Example input for visualizing the graph in Tensorboard
+        # if config['MANIPULATION']['channel_first'] == 'true':
+        # self.example_input_array = torch.zeros((16,kwargs['n_features'] , kwargs['length_sequence']), dtype=torch.float32)
+        # else:
+        # self.example_input_array = torch.zeros((16,kwargs['length_sequence'],kwargs['n_features'] ), dtype=torch.float32)
+
+        # Create metrics. If two classes compute precision, recall for each class else average
+        if kwargs["n_classes"] == 2:
+            metrics = MetricCollection(
+                [
+                    Accuracy(task="binary"),
+                    Precision(task="binary",average=None, num_classes=kwargs["n_classes"]),
+                    Recall(task="binary",average=None, num_classes=kwargs["n_classes"]),
+                ]
+            )
+            self.train_metrics = MetricCollection([Accuracy(task="binary")], prefix="train_")
+        else:
+            metrics = MetricCollection([Accuracy(task="multiclass"), Precision(task="multiclass"), Recall(task="multiclass")])
+            self.train_metrics = MetricCollection([Accuracy(task="multiclass")], prefix="train_")
+
+        # self.train_metrics = metrics.clone(prefix="train_")
         self.valid_metrics = metrics.clone(prefix="val_")
         self.test_metrics = metrics.clone(prefix="test_")
 
@@ -102,7 +108,8 @@ class ModelBase(pl.LightningModule):
         return self.model(imgs)
 
     def configure_optimizers(self):
-        # Support Adam or SGD as optimizers.
+        print("Configuring optimizers:", self.hparams["optimizer_name"])
+        # We will support Adam or SGD as optimizers.
         if self.hparams.optimizer_name == "Adam":
             # AdamW is Adam with a correct implementation of weight decay (see here
             # for details: https://arxiv.org/pdf/1711.05101.pdf)
@@ -112,7 +119,7 @@ class ModelBase(pl.LightningModule):
                 optimizer,
                 mode="min",
                 factor=0.1,
-                patience=10,
+                patience=8,
                 min_lr=1e-6,
                 verbose=True,
             )
@@ -123,15 +130,20 @@ class ModelBase(pl.LightningModule):
                 optimizer,
                 mode="min",
                 factor=0.1,
-                patience=10,
+                patience=8,
                 min_lr=1e-6,
                 verbose=True,
             )
-        elif self.hparams.optimizer_name == "cosine_warmup":
-            p = nn.Parameter(torch.empty(4, 4))
-            optimizer = optim.Adam([p], lr=1e-3)
-            scheduler = CosineWarmupScheduler(
-                optimizer=optimizer, warmup=20, max_iters=500
+        elif self.hparams.optimizer_name == "radam":
+            optimizer = optim.RAdam(self.parameters(), **self.hparams.optimizer_hparams)
+
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode="min",
+                factor=0.1,
+                patience=8,
+                min_lr=1e-6,
+                verbose=True,
             )
         else:
             assert False, f'Unknown optimizer: "{self.hparams.optimizer_name}"'
@@ -144,18 +156,29 @@ class ModelBase(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         # "batch" is the output of the training data loader.
         signal, labels = batch[self.signal_name], batch[self.target_name]
-        preds = self.model(signal)
-        if isinstance(self.loss_module, torch.nn.modules.loss.BCEWithLogitsLoss):
-            loss = self.loss_module(preds, labels.to(dtype=torch.float32))
+        if (self.augmenter != None):
+            signal = self.augmenter(signal, self.current_epoch)
 
+        if "covariates" in batch.keys():
+            covariates = batch["covariates"]
+            input = (signal, covariates)
+            preds = self.model(input)
+        else:
+            preds = self.model(signal)
+
+        if isinstance(
+            self.loss_module,torch.nn.modules.loss.BCEWithLogitsLoss,
+        ):
+            loss = self.loss_module(preds, labels)
         else:
             labels = labels.argmax(dim=-1)
             loss = self.loss_module(preds, labels)
         output = self.train_metrics(preds, labels)
         # use log_dict instead of log
         # metrics are logged with keys: train_Accuracy, train_Precision and train_Recall
+        output = {f"train/{k}": v for k, v in output.items()}
         self.log_dict(output)
-        self.log("train_loss", loss)
+        self.log("train/train_loss", loss)
         # Logs the accuracy per epoch to tensorboard (weighted average over batches)
         # self.log("train_acc", acc, on_step=False, on_epoch=True, prog_bar=True)
 
@@ -163,37 +186,59 @@ class ModelBase(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         signal, labels = batch[self.signal_name], batch[self.target_name]
-        preds = self.model(signal)
-        if isinstance(self.loss_module, torch.nn.modules.loss.BCEWithLogitsLoss):
-            loss = self.loss_module(preds, labels.to(dtype=torch.float32))
+        if "covariates" in batch.keys():
+            covariates = batch["covariates"]
+            input = (signal, covariates)
+            preds = self.model(input)
+        else:
+            preds = self.model(signal)
 
+        if isinstance(
+            self.loss_module,torch.nn.modules.loss.BCEWithLogitsLoss
+        ):
+            loss = self.loss_module(preds, labels)
         else:
             labels = labels.argmax(dim=-1)
             loss = self.loss_module(preds, labels)
         # By default logs it per epoch (weighted average over batches)
-        output = self.valid_metrics(preds, labels)
-        output["val_loss"] = loss
 
+        # preds = preds.argmax(dim=-1)
+        output = self.valid_metrics(preds, labels)
+        if preds.shape[1] == 2:
+            output = unwrap_metrics(output)
+        output["val_loss"] = loss
+        output = {f"val/{k}": v for k, v in output.items()}
+        self.log_dict(output, on_step=False, on_epoch=True)
         return output
 
     def validation_epoch_end(self, outputs):
-        avg_loss = torch.stack([x["val_loss"] for x in outputs]).mean()
-        avg_acc = torch.stack([x["val_Accuracy"] for x in outputs]).mean()
+        avg_loss = torch.stack([x["val/val_loss"] for x in outputs]).mean()
+        avg_acc = torch.stack([x["val/val_Accuracy"] for x in outputs]).mean()
         self.log("ptl/val_loss", avg_loss)
         self.log("ptl/val_Accuracy", avg_acc)
 
     def test_step(self, batch, batch_idx):
         signal, labels = batch[self.signal_name], batch[self.target_name]
-        preds = self.model(signal)
-        preds = self.model(signal)
-        if isinstance(self.loss_module, torch.nn.modules.loss.BCEWithLogitsLoss):
-            loss = self.loss_module(preds, labels.to(dtype=torch.float32))
-
+        if "covariates" in batch.keys():
+            covariates = batch["covariates"]
+            input = (signal, covariates)
+            preds = self.model(input)
+        else:
+            preds = self.model(signal)
+        if isinstance(
+            self.loss_module,torch.nn.modules.loss.BCEWithLogitsLoss
+        ):
+            loss = self.loss_module(preds, labels)
         else:
             labels = labels.argmax(dim=-1)
             loss = self.loss_module(preds, labels)
         # By default logs it per epoch (weighted average over batches), and returns it afterwards
+        # if preds.shape[1] == 2:
+        # preds = preds.argmax(dim=-1)
         output = self.test_metrics(preds, labels)
+        if preds.shape[1] == 2:
+            output = unwrap_metrics(output)
+        output = {f"test/{k}": v for k, v in output.items()}
         self.log_dict(output)
 
 
@@ -208,9 +253,9 @@ def create_model(model_hparams, **kwargs):
             model_hparams[x] for x in cell_config_key if model_hparams[x] > 0
         ]
 
-    if model_name in model_dict:
-        return model_dict[model_name](model_hparams, **kwargs)
+    if model_name in model_registry:
+        return model_registry[model_name](model_hparams, **kwargs)
     else:
         assert (
             False
-        ), f'Unknown model name "{model_name}". Available models are: {str(model_dict.keys())}'
+        ), f'Unknown model name "{model_name}". Available models are: {str(model_registry.keys())}'
