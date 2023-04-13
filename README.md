@@ -10,7 +10,7 @@
 </div>
 
 This repository is the implementation code for :
-[Evaluation of post-hoc interpretability methods in time-series classification](http://arxiv.org/abs/2202.05656).
+[Evaluation of post-hoc interpretability methods in time-series classification]([http://arxiv.org/abs/2202.05656](https://www.nature.com/articles/s42256-023-00620-w)).
 
 If you find this code or idea useful, please consider citing our work:
 
