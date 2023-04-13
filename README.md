@@ -15,12 +15,7 @@ This repository is the implementation code for :
 If you find this code or idea useful, please consider citing our work:
 
 ```
-@misc{turbé2022interprettime,
-      title={Evaluation of post-hoc interpretability methods in time-series classification},
-      author={Hugues Turbé and Mina Bjelogrlic and Christian Lovis and Gianmarco Mengaldo},
-      year={2022},
-      eprint={2202.05656},
-}
+Turbé, H., Bjelogrlic, M., Lovis, C. et al. Evaluation of post-hoc interpretability methods in time-series classification. Nat Mach Intell 5, 250–260 (2023). https://doi.org/10.1038/s42256-023-00620-w
 ```
 
 #### Table of Contents
